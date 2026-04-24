@@ -15,8 +15,10 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from beatreel import medal as medal_api
 from beatreel import youtube as yt
+from beatreel.aspect import available as available_aspects
 from beatreel.pipeline import PipelineConfig, run
 from beatreel.render import ensure_ffmpeg
+from beatreel.scenes import scene_detection_available
 
 BASE_DIR = Path(__file__).parent
 JOBS_ROOT = BASE_DIR / "jobs"
@@ -36,8 +38,15 @@ class Job:
     num_candidates: Optional[int] = None
     num_clips_scanned: Optional[int] = None
     final_duration: Optional[float] = None
+    seed: Optional[int] = None
+    aspect: str = "landscape"
     error: Optional[str] = None
     output_path: Optional[str] = None
+    # inputs kept so we can re-roll without re-uploading
+    clips_dir: Optional[str] = None
+    music_path: Optional[str] = None
+    target_duration: float = 60.0
+    intensity: str = "balanced"
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def snapshot(self) -> dict:
@@ -45,6 +54,8 @@ class Job:
             d = asdict(self)
         d.pop("lock", None)
         d.pop("output_path", None)
+        d.pop("clips_dir", None)
+        d.pop("music_path", None)
         return d
 
 
@@ -59,9 +70,16 @@ app = FastAPI(title="beatreel", version="0.1.0")
 def health() -> dict:
     try:
         ensure_ffmpeg()
-        return {"ok": True, "ffmpeg": True, "ffmpeg_error": None}
+        ffmpeg_ok, ffmpeg_err = True, None
     except Exception as exc:
-        return {"ok": True, "ffmpeg": False, "ffmpeg_error": str(exc)}
+        ffmpeg_ok, ffmpeg_err = False, str(exc)
+    return {
+        "ok": True,
+        "ffmpeg": ffmpeg_ok,
+        "ffmpeg_error": ffmpeg_err,
+        "scene_detection": scene_detection_available(),
+        "aspects": available_aspects(),
+    }
 
 
 # ── Medal ────────────────────────────────────────────────────────────────────
@@ -119,6 +137,8 @@ async def create_job(
     clips: Optional[list[UploadFile]] = File(None),
     duration: float = Form(60.0),
     intensity: Literal["chill", "balanced", "hype"] = Form("balanced"),
+    aspect: Literal["landscape", "portrait", "square"] = Form("landscape"),
+    seed: Optional[int] = Form(None),
     medal_clip_ids: Optional[str] = Form(None),
     medal_user_id: Optional[str] = Form(None),
     medal_share_urls: Optional[str] = Form(None),
@@ -170,7 +190,13 @@ async def create_job(
             shutil.copyfileobj(music.file, f)
 
     # Create the Job record
-    job = Job(id=job_id)
+    job = Job(
+        id=job_id,
+        target_duration=float(duration),
+        intensity=intensity,
+        aspect=aspect,
+        seed=seed,
+    )
     with JOBS_LOCK:
         JOBS[job_id] = job
 
@@ -182,6 +208,8 @@ async def create_job(
         "music_path": music_path,
         "duration": float(duration),
         "intensity": intensity,
+        "aspect": aspect,
+        "seed": seed,
         "medal_key": x_medal_key,
         "medal_user_id": medal_user_id,
         "medal_clip_ids": (
@@ -207,6 +235,8 @@ def _run_job(
     music_path: Optional[Path],
     duration: float,
     intensity: str,
+    aspect: str,
+    seed: Optional[int],
     medal_key: Optional[str],
     medal_user_id: Optional[str],
     medal_clip_ids: list[str],
@@ -266,7 +296,12 @@ def _run_job(
             output_path=output_path,
             target_duration=duration,
             intensity=intensity,  # type: ignore[arg-type]
+            aspect=aspect,  # type: ignore[arg-type]
+            seed=seed,
         )
+        with job.lock:
+            job.clips_dir = str(clips_dir)
+            job.music_path = str(music_path)
 
         # Pipeline progress is scaled into 0.08 → 1.0 to leave room for fetch stages
         def pipeline_progress(stage: str, frac: float) -> None:
@@ -297,6 +332,67 @@ def get_job(job_id: str) -> dict:
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
     return job.snapshot()
+
+
+@app.post("/api/jobs/{job_id}/reroll")
+def reroll_job(job_id: str) -> dict:
+    """Re-run the pipeline on the same inputs with a fresh random seed.
+
+    Re-uses cached per-clip scores, so only planning + rendering run again.
+    """
+    import secrets
+
+    with JOBS_LOCK:
+        prev = JOBS.get(job_id)
+    if not prev:
+        raise HTTPException(status_code=404, detail="job not found")
+    with prev.lock:
+        clips_dir = prev.clips_dir
+        music_path = prev.music_path
+        duration = prev.target_duration
+        intensity = prev.intensity
+        aspect = prev.aspect
+    if not clips_dir or not music_path:
+        raise HTTPException(status_code=409, detail="original job inputs not available")
+    if not Path(clips_dir).exists() or not Path(music_path).exists():
+        raise HTTPException(status_code=410, detail="original job inputs have been cleaned up")
+
+    new_id = uuid.uuid4().hex[:12]
+    new_dir = JOBS_ROOT / new_id
+    new_dir.mkdir(parents=True, exist_ok=True)
+    new_seed = secrets.randbelow(2**31 - 1)
+
+    new_job = Job(
+        id=new_id,
+        target_duration=duration,
+        intensity=intensity,
+        aspect=aspect,
+        seed=new_seed,
+    )
+    with JOBS_LOCK:
+        JOBS[new_id] = new_job
+
+    thread = threading.Thread(
+        target=_run_job,
+        kwargs={
+            "job": new_job,
+            "job_dir": new_dir,
+            "clips_dir": Path(clips_dir),
+            "music_path": Path(music_path),
+            "duration": duration,
+            "intensity": intensity,
+            "aspect": aspect,
+            "seed": new_seed,
+            "medal_key": None,
+            "medal_user_id": None,
+            "medal_clip_ids": [],
+            "medal_share_urls": [],
+            "youtube_url": None,
+        },
+        daemon=True,
+    )
+    thread.start()
+    return {"job_id": new_id, "seed": new_seed}
 
 
 @app.get("/api/jobs/{job_id}/video")

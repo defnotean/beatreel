@@ -100,15 +100,19 @@ export type MusicSource =
   | { type: "upload"; file: File }
   | { type: "youtube"; url: string };
 
+export type Aspect = "landscape" | "portrait" | "square";
+
 export async function createJob(params: {
   clips: ClipSource;
   music: MusicSource;
   duration: number;
   intensity: "chill" | "balanced" | "hype";
+  aspect: Aspect;
 }): Promise<{ job_id: string }> {
   const fd = new FormData();
   fd.append("duration", String(params.duration));
   fd.append("intensity", params.intensity);
+  fd.append("aspect", params.aspect);
 
   if (params.clips.type === "upload") {
     for (const c of params.clips.files) fd.append("clips", c);
@@ -144,6 +148,15 @@ export async function createJob(params: {
 export async function getJob(jobId: string): Promise<JobState> {
   const r = await fetch(`/api/jobs/${jobId}`);
   if (!r.ok) throw new Error(`job fetch failed: ${r.status}`);
+  return r.json();
+}
+
+export async function rerollJob(jobId: string): Promise<{ job_id: string; seed: number }> {
+  const r = await fetch(`/api/jobs/${jobId}/reroll`, { method: "POST" });
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`reroll failed: ${t}`);
+  }
   return r.json();
 }
 

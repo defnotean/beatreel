@@ -33,11 +33,13 @@ def detect_beats(music_path: str | Path, sr: int = 22050) -> BeatGrid:
     tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, units="frames")
     beat_times = librosa.frames_to_time(beat_frames, sr=sr)
 
-    # Every 4th beat as an approximate downbeat (naive but works for 4/4)
+    # librosa >=0.10 returns tempo as a 1-D ndarray; older versions a scalar.
+    tempo_scalar = float(np.asarray(tempo).reshape(-1)[0]) if np.size(tempo) else 0.0
+
     downbeat_times = beat_times[::4] if len(beat_times) else beat_times
 
     return BeatGrid(
-        tempo=float(tempo),
+        tempo=tempo_scalar,
         beat_times=beat_times,
         downbeat_times=downbeat_times,
         duration=duration,

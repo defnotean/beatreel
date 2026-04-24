@@ -7,6 +7,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from .aspect import AspectSpec, get_aspect
+
 
 @dataclass
 class CutPlan:
@@ -27,24 +29,41 @@ def ensure_ffmpeg() -> None:
         raise RuntimeError("ffprobe not found on PATH (ships with ffmpeg).")
 
 
-def _has_encoder(name: str) -> bool:
+_ENCODER_CACHE: dict[str, bool] = {}
+
+
+def _encoder_works(name: str) -> bool:
+    """Probe whether ffmpeg can actually encode with `name` on this machine.
+
+    Listing an encoder in `-encoders` doesn't mean it works — h264_nvenc is
+    listed even when no NVIDIA GPU / driver is present, and ffmpeg will fail
+    at runtime. Do a real trial encode once and cache the result.
+    """
+    if name in _ENCODER_CACHE:
+        return _ENCODER_CACHE[name]
     try:
-        out = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-encoders"],
-            capture_output=True, text=True, check=True,
-        ).stdout
-        return f" {name} " in out
-    except Exception:
-        return False
+        res = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.1:r=10",
+                "-c:v", name, "-frames:v", "1", "-f", "null", "-",
+            ],
+            capture_output=True, timeout=10,
+        )
+        ok = res.returncode == 0
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+        ok = False
+    _ENCODER_CACHE[name] = ok
+    return ok
 
 
 def _pick_video_encoder() -> tuple[str, list[str]]:
-    """Prefer hardware encoder if available, fall back to libx264."""
-    if _has_encoder("h264_nvenc"):
+    """Prefer a *working* hardware encoder; fall back to libx264."""
+    if _encoder_works("h264_nvenc"):
         return "h264_nvenc", ["-preset", "p5", "-cq", "20"]
-    if _has_encoder("h264_videotoolbox"):
+    if _encoder_works("h264_videotoolbox"):
         return "h264_videotoolbox", ["-b:v", "8M"]
-    if _has_encoder("h264_qsv"):
+    if _encoder_works("h264_qsv"):
         return "h264_qsv", ["-global_quality", "22"]
     return "libx264", ["-preset", "fast", "-crf", "20"]
 
@@ -53,6 +72,7 @@ def render_reel(
     cuts: list[CutPlan],
     music_path: Path,
     output_path: Path,
+    aspect: AspectSpec | str = "landscape",
     music_gain_db: float = 0.0,
     game_gain_db: float = -18.0,
     on_log=None,
@@ -62,6 +82,7 @@ def render_reel(
     if not cuts:
         raise ValueError("No cuts provided — nothing to render.")
 
+    aspect_spec = aspect if isinstance(aspect, AspectSpec) else get_aspect(aspect)  # type: ignore[arg-type]
     encoder, enc_args = _pick_video_encoder()
 
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -76,8 +97,7 @@ def render_reel(
                 "-ss", f"{cut.start:.3f}",
                 "-i", str(cut.clip_path),
                 "-t", f"{cut.duration:.3f}",
-                "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,"
-                        "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=60",
+                "-vf", aspect_spec.video_filter,
                 "-c:v", encoder, *enc_args,
                 "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
                 "-pix_fmt", "yuv420p",

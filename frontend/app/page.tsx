@@ -16,6 +16,7 @@ import { Logo } from "@/components/Logo";
 import { DropZone } from "@/components/DropZone";
 import { IntensityPicker, type Intensity } from "@/components/IntensityPicker";
 import { DurationSlider } from "@/components/DurationSlider";
+import { AspectPicker, type Aspect } from "@/components/AspectPicker";
 import { ProgressPanel } from "@/components/ProgressPanel";
 import { ResultPanel } from "@/components/ResultPanel";
 import { SettingsModal } from "@/components/SettingsModal";
@@ -57,6 +58,7 @@ export default function Home() {
   // Params
   const [duration, setDuration] = useState(60);
   const [intensity, setIntensity] = useState<Intensity>("balanced");
+  const [aspect, setAspect] = useState<Aspect>("landscape");
 
   // App state
   const [view, setView] = useState<View>("setup");
@@ -114,37 +116,10 @@ export default function Home() {
         music: musicParam,
         duration,
         intensity,
+        aspect,
       });
 
-      setJob({
-        id: job_id,
-        status: "queued",
-        stage: "queued",
-        progress: 0,
-        tempo: null,
-        num_cuts: null,
-        num_candidates: null,
-        num_clips_scanned: null,
-        final_duration: null,
-        error: null,
-      });
-
-      pollRef.current = setInterval(async () => {
-        try {
-          const state = await getJob(job_id);
-          setJob(state);
-          if (state.status === "done") {
-            if (pollRef.current) clearInterval(pollRef.current);
-            setView("done");
-          } else if (state.status === "error") {
-            if (pollRef.current) clearInterval(pollRef.current);
-            setErrMsg(state.error || "Pipeline failed");
-            setView("error");
-          }
-        } catch {
-          /* keep polling on transient blips */
-        }
-      }, 500);
+      startPolling(job_id);
     } catch (e) {
       setErrMsg(e instanceof Error ? e.message : String(e));
       setView("error");
@@ -162,6 +137,40 @@ export default function Home() {
     setJob(null);
     setErrMsg(null);
     setView("setup");
+  }
+
+  function startPolling(jobId: string) {
+    if (pollRef.current) clearInterval(pollRef.current);
+    setView("processing");
+    setErrMsg(null);
+    setJob({
+      id: jobId,
+      status: "queued",
+      stage: "queued",
+      progress: 0,
+      tempo: null,
+      num_cuts: null,
+      num_candidates: null,
+      num_clips_scanned: null,
+      final_duration: null,
+      error: null,
+    });
+    pollRef.current = setInterval(async () => {
+      try {
+        const state = await getJob(jobId);
+        setJob(state);
+        if (state.status === "done") {
+          if (pollRef.current) clearInterval(pollRef.current);
+          setView("done");
+        } else if (state.status === "error") {
+          if (pollRef.current) clearInterval(pollRef.current);
+          setErrMsg(state.error || "Pipeline failed");
+          setView("error");
+        }
+      } catch {
+        /* keep polling on transient blips */
+      }
+    }, 500);
   }
 
   const submitLabel = !clipsReady
@@ -299,6 +308,7 @@ export default function Home() {
             {/* Params */}
             <div className="glass rounded-2xl p-6 space-y-6">
               <IntensityPicker value={intensity} onChange={setIntensity} />
+              <AspectPicker value={aspect} onChange={setAspect} />
               <DurationSlider value={duration} onChange={setDuration} />
             </div>
 
@@ -317,7 +327,13 @@ export default function Home() {
         )}
 
         {view === "processing" && job && <ProgressPanel job={job} />}
-        {view === "done" && job && <ResultPanel job={job} onReset={reset} />}
+        {view === "done" && job && (
+          <ResultPanel
+            job={job}
+            onReset={reset}
+            onReroll={(newJobId) => startPolling(newJobId)}
+          />
+        )}
         {view === "error" && (
           <div className="glass rounded-2xl p-8 text-center">
             <AlertTriangle className="h-10 w-10 text-red-400 mx-auto mb-3" />
