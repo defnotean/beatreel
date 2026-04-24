@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+.next/
+out/
+.turbo/
+npm-debug.log*
+
+# Runtime / outputs
+backend/jobs/
+backend/uploads/
+*.mp4
+*.mov
+*.mkv
+*.mp3
+*.wav
+*.flac
+!frontend/public/*.mp4
+
+# Editor / OS
+.vscode/
+.idea/
+.claude/
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.local
