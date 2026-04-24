@@ -58,54 +58,55 @@ export function YouTubeInput({
   }, [value]);
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-2">
       <div className="relative">
-        <Link2 className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-white/30" />
+        <Link2 className="absolute left-3 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-fg-muted" />
         <input
           type="url"
           value={value}
           onChange={(e) => onChange(e.target.value)}
-          placeholder="Paste a YouTube URL..."
+          placeholder="https://youtube.com/..."
           className={cn(
-            "w-full bg-black/40 border border-border rounded-xl pl-10 pr-10 py-3",
-            "text-[13.5px] placeholder:text-white/25",
-            "focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/30",
+            "w-full bg-surface-1 border border-border",
+            "pl-9 pr-9 py-2.5",
+            "font-mono text-[12px] text-fg placeholder:text-fg-muted",
+            "focus:border-accent focus:outline-none",
           )}
         />
         {loading && (
-          <Loader2 className="absolute right-3 top-1/2 -translate-y-1/2 h-4 w-4 text-accent-glow animate-spin" />
+          <Loader2 className="absolute right-3 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-fg-dim animate-spin" />
         )}
       </div>
 
       {error && (
-        <div className="flex items-start gap-2 rounded-lg border border-red-500/30 bg-red-500/5 p-3 text-[12.5px] text-red-300">
-          <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
-          <span>{error}</span>
+        <div className="flex items-start gap-2 border border-err/50 bg-err/5 p-2.5 font-mono text-[11.5px] text-err">
+          <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+          <span className="break-all">{error}</span>
         </div>
       )}
 
       {preview && (
-        <div className="flex gap-3 rounded-xl border border-border bg-black/30 p-3">
+        <div className="flex gap-3 border border-border bg-surface-1 p-2.5">
           {preview.thumbnail ? (
             // eslint-disable-next-line @next/next/no-img-element
             <img
               src={preview.thumbnail}
               alt=""
-              className="h-16 w-28 shrink-0 rounded-lg object-cover border border-border"
+              className="h-14 w-24 shrink-0 object-cover border border-border"
             />
           ) : (
-            <div className="h-16 w-28 shrink-0 rounded-lg bg-gradient-to-br from-red-500/20 to-orange-500/10 flex items-center justify-center">
-              <Youtube className="h-5 w-5 text-red-400" />
+            <div className="h-14 w-24 shrink-0 bg-surface-2 flex items-center justify-center border border-border">
+              <Youtube className="h-4 w-4 text-fg-muted" />
             </div>
           )}
-          <div className="min-w-0 flex-1">
-            <div className="truncate text-[13.5px] font-medium">
+          <div className="min-w-0 flex-1 flex flex-col">
+            <div className="truncate text-[12.5px] text-fg">
               {preview.title}
             </div>
-            <div className="mt-0.5 truncate text-[11.5px] text-white/50">
+            <div className="mt-0.5 truncate font-mono text-[11px] text-fg-dim">
               {preview.uploader}
             </div>
-            <div className="mt-1 font-mono text-[11px] text-accent-glow">
+            <div className="mt-auto font-mono text-[10.5px] text-fg-muted uppercase tracking-[0.08em]">
               {formatDuration(preview.duration)}
             </div>
           </div>

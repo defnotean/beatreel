@@ -7,35 +7,39 @@ export function DurationSlider({
   value: number;
   onChange: (v: number) => void;
 }) {
-  const pct = ((value - 15) / (180 - 15)) * 100;
+  const min = 15;
+  const max = 180;
+  const pct = ((value - min) / (max - min)) * 100;
   return (
-    <div className="space-y-3">
+    <div className="space-y-2">
       <div className="flex items-baseline justify-between">
-        <span className="text-[13px] text-white/70">Target duration</span>
-        <span className="font-mono text-[15px] text-accent-glow">
+        <span className="font-mono text-[11px] uppercase tracking-[0.12em] text-fg-muted">
+          Duration
+        </span>
+        <span className="font-mono text-[14px] text-fg tabular-nums">
           {value}s
         </span>
       </div>
-      <div className="relative h-2 rounded-full bg-black/40 overflow-hidden">
+      <div className="relative h-[6px] bg-surface-1 border border-border">
         <div
-          className="absolute inset-y-0 left-0 bg-accent-gradient rounded-full transition-all"
+          className="absolute inset-y-0 left-0 bg-accent"
           style={{ width: `${pct}%` }}
         />
         <input
           type="range"
-          min={15}
-          max={180}
+          min={min}
+          max={max}
           step={5}
           value={value}
           onChange={(e) => onChange(Number(e.target.value))}
-          className="absolute inset-0 w-full h-full cursor-pointer opacity-0"
-          aria-label="target duration in seconds"
+          className="absolute inset-0 w-full h-full cursor-pointer"
+          aria-label="Target duration in seconds"
         />
       </div>
-      <div className="flex justify-between text-[10.5px] text-white/35 font-mono">
-        <span>15s</span>
+      <div className="flex justify-between font-mono text-[10px] text-fg-muted tabular-nums">
+        <span>{min}s</span>
         <span>60s</span>
-        <span>180s</span>
+        <span>{max}s</span>
       </div>
     </div>
   );

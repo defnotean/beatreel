@@ -154,6 +154,10 @@ def resolve_clip_download_url(clip: MedalClip) -> Optional[str]:
 
 
 _MEDAL_HOST_RE = re.compile(r"^https?://(?:www\.|m\.)?medal\.tv/", re.IGNORECASE)
+_USERNAME_FROM_URL_RE = re.compile(
+    r"^https?://(?:www\.|m\.)?medal\.tv/u/([A-Za-z0-9_.-]+)", re.IGNORECASE,
+)
+_USERNAME_SAFE_RE = re.compile(r"^[A-Za-z0-9_.-]{2,40}$")
 _CLIP_ID_PATTERNS = [
     re.compile(r"[?&]contentId=([A-Za-z0-9]+)"),
     re.compile(r"/clips/([A-Za-z0-9]+)"),
@@ -250,6 +254,153 @@ def resolve_share_url(url: str) -> MedalClip:
         embed_iframe_url="",
         created_ms=0,
     )
+
+
+def parse_username(input_str: str) -> str:
+    """Accept a bare username or a medal.tv/u/<username> URL and return the username."""
+    s = (input_str or "").strip()
+    if not s:
+        raise MedalError("Enter a Medal username or profile URL.")
+    m = _USERNAME_FROM_URL_RE.match(s)
+    if m:
+        username = m.group(1)
+    else:
+        # Strip a leading @ or /u/ for convenience
+        username = s.lstrip("@").lstrip("/").removeprefix("u/")
+    if not _USERNAME_SAFE_RE.match(username):
+        raise MedalError(f"Doesn't look like a Medal username: {input_str!r}")
+    return username
+
+
+def _find_matching_brace(text: str, start: int) -> int:
+    """Return the index one past the `}` that balances the `{` at start, or -1."""
+    depth = 0
+    i = start
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        elif c == '"':
+            # skip string literal, respecting escapes
+            i += 1
+            while i < n and text[i] != '"':
+                if text[i] == "\\":
+                    i += 1
+                i += 1
+        i += 1
+    return -1
+
+
+# Anchors the clip JSON objects embedded in the profile HTML. The profile
+# page currently emits records starting `{"contentId":"…","contentType":15`
+# — contentType 15 is a published clip. Using the anchor prevents us from
+# matching embedded sub-objects (like `parent`, `contentCollections`).
+_CLIP_OBJECT_ANCHOR_RE = re.compile(
+    r'\{"contentId":"([A-Za-z0-9_-]+)","contentType":15\b',
+)
+
+
+def _parse_public_clip_obj(obj: dict[str, Any], fallback_direct_url: str = "") -> MedalClip:
+    """Map a raw Medal profile-page clip dict onto our MedalClip dataclass.
+
+    The profile page gives us presigned `contentUrl` MP4 links directly, so
+    unlike the authenticated library flow we don't need `rawFileUrl` or a
+    scrape-fallback — `contentUrl` downloads as-is.
+    """
+    content_id = str(obj.get("contentId") or "")
+    title = obj.get("contentTitle") or "Untitled clip"
+    duration = float(obj.get("videoLengthSeconds") or 0.0)
+    thumbnail = (
+        obj.get("thumbnailUrl")
+        or obj.get("thumbnail720p")
+        or obj.get("thumbnail480p")
+        or obj.get("thumbnail360p")
+        or obj.get("thumbnail1080p")
+        or ""
+    )
+    content_url = (
+        obj.get("contentUrl")
+        or obj.get("contentUrl1080p")
+        or obj.get("contentUrl720p")
+        or obj.get("contentUrl480p")
+        or obj.get("contentUrl360p")
+        or ""
+    )
+    share_url = obj.get("contentShareUrl") or fallback_direct_url or ""
+    published = obj.get("publishedAt") or obj.get("created") or 0
+
+    return MedalClip(
+        content_id=content_id,
+        title=str(title),
+        duration=duration,
+        thumbnail=str(thumbnail),
+        direct_clip_url=str(share_url),
+        raw_file_url=str(content_url) if content_url else None,
+        embed_iframe_url="",
+        created_ms=int(published),
+    )
+
+
+def list_user_public_clips(
+    username_or_url: str,
+    limit: int = 50,
+) -> tuple[list[MedalClip], str]:
+    """Fetch a Medal user's public profile page and return their clips.
+
+    Works without an API key. Returns (clips, resolved_username).
+    """
+    username = parse_username(username_or_url)
+    url = f"https://medal.tv/u/{username}"
+
+    try:
+        with httpx.Client(
+            timeout=15.0,
+            headers={"User-Agent": "Mozilla/5.0 beatreel/0.1"},
+            follow_redirects=True,
+        ) as client:
+            r = client.get(url)
+    except httpx.HTTPError as exc:
+        raise MedalError(f"Couldn't reach Medal: {exc}")
+
+    if r.status_code == 404:
+        raise MedalError(f"Medal user not found: {username}")
+    if r.status_code >= 400:
+        raise MedalError(f"Medal returned {r.status_code} for {url}")
+
+    html_text = r.text
+    clips: list[MedalClip] = []
+    seen: set[str] = set()
+
+    for match in _CLIP_OBJECT_ANCHOR_RE.finditer(html_text):
+        cid = match.group(1)
+        if cid in seen:
+            continue
+        start = match.start()
+        end = _find_matching_brace(html_text, start)
+        if end < 0:
+            continue
+        blob = html_text[start:end]
+        try:
+            obj = json.loads(blob)
+        except json.JSONDecodeError:
+            continue
+        clip = _parse_public_clip_obj(obj, fallback_direct_url=f"https://medal.tv/?contentId={cid}")
+        if not clip.raw_file_url:
+            # No playable URL; skip rather than surface a broken card.
+            continue
+        clips.append(clip)
+        seen.add(cid)
+        if len(clips) >= limit:
+            break
+
+    # Newest first
+    clips.sort(key=lambda c: c.created_ms, reverse=True)
+    return clips, username
 
 
 def download_clip(clip: MedalClip, dest_dir: Path) -> Path:

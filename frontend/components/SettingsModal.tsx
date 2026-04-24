@@ -3,7 +3,13 @@
 import { useEffect, useState } from "react";
 import { Eye, EyeOff, X } from "lucide-react";
 import { cn } from "@/lib/cn";
-import { loadMedalSettings, saveMedalSettings, type MedalSettings } from "@/lib/settings";
+import {
+  loadGeminiKeys,
+  loadMedalSettings,
+  saveGeminiKeys,
+  saveMedalSettings,
+  type MedalSettings,
+} from "@/lib/settings";
 
 export function SettingsModal({
   open,
@@ -17,12 +23,15 @@ export function SettingsModal({
   const [apiKey, setApiKey] = useState("");
   const [userId, setUserId] = useState("");
   const [showKey, setShowKey] = useState(false);
+  const [geminiKeysText, setGeminiKeysText] = useState("");
+  const [showGemini, setShowGemini] = useState(false);
 
   useEffect(() => {
     if (open) {
       const s = loadMedalSettings();
       setApiKey(s.apiKey);
       setUserId(s.userId);
+      setGeminiKeysText(loadGeminiKeys().join("\n"));
     }
   }, [open]);
 
@@ -38,90 +47,150 @@ export function SettingsModal({
   if (!open) return null;
 
   function save() {
-    const s = { apiKey: apiKey.trim(), userId: userId.trim() };
-    saveMedalSettings(s);
-    onSaved(s);
+    const medal = { apiKey: apiKey.trim(), userId: userId.trim() };
+    saveMedalSettings(medal);
+    const keys = geminiKeysText
+      .split(/[\n,]/)
+      .map((k) => k.trim().replace(/^["']|["']$/g, ""))
+      .filter(Boolean);
+    saveGeminiKeys(keys);
+    onSaved(medal);
     onClose();
   }
+
+  const keyCount = geminiKeysText
+    .split(/[\n,]/)
+    .map((k) => k.trim())
+    .filter(Boolean).length;
 
   return (
     <div
       role="dialog"
       aria-modal="true"
-      className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-black/60 backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-black/70"
       onClick={onClose}
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        className="glass w-full max-w-md rounded-2xl p-6 shadow-glow-lg"
+        className="w-full max-w-md border border-border bg-surface-1"
       >
-        <div className="flex items-start justify-between mb-5">
-          <div>
-            <div className="text-[11px] uppercase tracking-[0.18em] text-accent-glow mb-1">
-              settings
-            </div>
-            <h2 className="text-lg font-medium">Medal integration</h2>
-          </div>
+        <header className="flex items-center justify-between px-4 py-3 border-b border-border">
+          <h2 className="font-mono text-[11px] uppercase tracking-[0.12em] text-fg-dim">
+            Settings
+          </h2>
           <button
             onClick={onClose}
-            className="rounded-lg p-1.5 text-white/50 hover:bg-white/5 hover:text-white transition-colors"
-            aria-label="close"
+            className="text-fg-muted hover:text-fg"
+            aria-label="Close"
           >
             <X className="h-4 w-4" />
           </button>
-        </div>
+        </header>
 
-        <div className="space-y-4">
-          <Field label="Medal API key" hint="Private key (starts with priv_). Stored locally in your browser — never sent anywhere except Medal.">
-            <div className="relative">
+        <div className="p-4 space-y-5">
+          <section>
+            <div className="flex items-baseline justify-between mb-2">
+              <span className="font-mono text-[10.5px] uppercase tracking-[0.14em] text-fg-muted">
+                Gemini · AI director
+              </span>
+              <span className="font-mono text-[10.5px] text-fg-dim tabular-nums">
+                {keyCount} {keyCount === 1 ? "key" : "keys"}
+              </span>
+            </div>
+            <Field
+              label="API keys — one per line"
+              hint="Each key runs one clip in parallel. More keys = faster analysis. Stored only in your browser."
+            >
+              <div className="relative">
+                <textarea
+                  value={showGemini ? geminiKeysText : geminiKeysText.replace(/[^\n,]/g, "•")}
+                  onChange={(e) => setGeminiKeysText(e.target.value)}
+                  placeholder="AIza...&#10;AIza...&#10;AIza..."
+                  autoComplete="off"
+                  rows={4}
+                  spellCheck={false}
+                  className={cn(
+                    "w-full bg-bg border border-border px-3 py-2 pr-10",
+                    "font-mono text-[12px] text-fg placeholder:text-fg-muted",
+                    "focus:border-accent focus:outline-none",
+                    "resize-none",
+                  )}
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowGemini((v) => !v)}
+                  className="absolute right-2 top-2 p-1 text-fg-muted hover:text-fg"
+                  aria-label={showGemini ? "Hide keys" : "Show keys"}
+                >
+                  {showGemini ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                </button>
+              </div>
+            </Field>
+          </section>
+
+          <section>
+            <div className="font-mono text-[10.5px] uppercase tracking-[0.14em] text-fg-muted mb-2">
+              Medal · Clip library
+            </div>
+            <Field
+              label="API key"
+              hint="Private key (priv_…). Stored only in your browser."
+            >
+              <div className="relative">
+                <input
+                  type={showKey ? "text" : "password"}
+                  value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)}
+                  placeholder="priv_..."
+                  autoComplete="off"
+                  className={cn(
+                    "w-full bg-bg border border-border px-3 py-2 pr-10",
+                    "font-mono text-[12px] text-fg placeholder:text-fg-muted",
+                    "focus:border-accent focus:outline-none",
+                  )}
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowKey((v) => !v)}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-fg-muted hover:text-fg"
+                  aria-label={showKey ? "Hide key" : "Show key"}
+                >
+                  {showKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                </button>
+              </div>
+            </Field>
+
+            <div className="h-3" />
+
+            <Field
+              label="User ID"
+              hint="Optional. Leave empty to list all clips the key can access."
+            >
               <input
-                type={showKey ? "text" : "password"}
-                value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
-                placeholder="priv_..."
-                autoComplete="off"
+                type="text"
+                value={userId}
+                onChange={(e) => setUserId(e.target.value)}
+                placeholder="12345"
                 className={cn(
-                  "w-full bg-black/40 border border-border rounded-lg px-3 py-2.5 pr-10",
-                  "text-[13.5px] font-mono placeholder:text-white/20",
-                  "focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/30",
+                  "w-full bg-bg border border-border px-3 py-2",
+                  "font-mono text-[12px] text-fg placeholder:text-fg-muted",
+                  "focus:border-accent focus:outline-none",
                 )}
               />
-              <button
-                type="button"
-                onClick={() => setShowKey((v) => !v)}
-                className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1.5 text-white/40 hover:text-white/80"
-                aria-label={showKey ? "hide key" : "show key"}
-              >
-                {showKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-              </button>
-            </div>
-          </Field>
-
-          <Field label="Medal user ID (optional)" hint="Leave empty to show the latest clips your key has access to.">
-            <input
-              type="text"
-              value={userId}
-              onChange={(e) => setUserId(e.target.value)}
-              placeholder="e.g. 12345"
-              className={cn(
-                "w-full bg-black/40 border border-border rounded-lg px-3 py-2.5",
-                "text-[13.5px] font-mono placeholder:text-white/20",
-                "focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/30",
-              )}
-            />
-          </Field>
+            </Field>
+          </section>
         </div>
 
-        <div className="mt-6 flex gap-3">
+        <div className="grid grid-cols-2 border-t border-border">
           <button
             onClick={onClose}
-            className="flex-1 py-2.5 rounded-lg border border-border text-white/70 hover:bg-white/5 hover:text-white text-[13.5px] transition-colors"
+            className="py-3 border-r border-border font-mono text-[12px] uppercase tracking-[0.1em] text-fg-dim hover:text-fg hover:bg-surface-2"
           >
             Cancel
           </button>
           <button
             onClick={save}
-            className="flex-1 py-2.5 rounded-lg bg-accent-gradient text-white font-medium text-[13.5px] shadow-glow hover:shadow-glow-lg transition-all"
+            className="py-3 bg-accent text-white font-mono text-[12px] uppercase tracking-[0.1em] hover:brightness-110"
           >
             Save
           </button>
@@ -142,9 +211,11 @@ function Field({
 }) {
   return (
     <div className="space-y-1.5">
-      <label className="text-[12.5px] font-medium text-white/80">{label}</label>
+      <label className="font-mono text-[11px] uppercase tracking-[0.12em] text-fg-muted">
+        {label}
+      </label>
       {children}
-      {hint && <p className="text-[11.5px] text-white/40 leading-relaxed">{hint}</p>}
+      {hint && <p className="text-[11px] text-fg-muted leading-relaxed">{hint}</p>}
     </div>
   );
 }

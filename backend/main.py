@@ -1,14 +1,22 @@
 """FastAPI server wrapping the beatreel pipeline."""
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import threading
 import traceback
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Literal, Optional
+
+# Load backend/.env before importing anything that reads env vars.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).with_name(".env"))
+except ImportError:
+    pass
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
@@ -17,6 +25,7 @@ from beatreel import medal as medal_api
 from beatreel import youtube as yt
 from beatreel.aspect import available as available_aspects
 from beatreel.pipeline import PipelineConfig, run
+from beatreel.gemini_pool import keys_from_env, parse_keys
 from beatreel.render import ensure_ffmpeg
 from beatreel.scenes import scene_detection_available
 
@@ -47,16 +56,13 @@ class Job:
     music_path: Optional[str] = None
     target_duration: float = 60.0
     intensity: str = "balanced"
+    game: str = "valorant"
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def snapshot(self) -> dict:
+        excluded = {"lock", "output_path", "clips_dir", "music_path"}
         with self.lock:
-            d = asdict(self)
-        d.pop("lock", None)
-        d.pop("output_path", None)
-        d.pop("clips_dir", None)
-        d.pop("music_path", None)
-        return d
+            return {f.name: getattr(self, f.name) for f in fields(self) if f.name not in excluded}
 
 
 JOBS: dict[str, Job] = {}
@@ -73,12 +79,17 @@ def health() -> dict:
         ffmpeg_ok, ffmpeg_err = True, None
     except Exception as exc:
         ffmpeg_ok, ffmpeg_err = False, str(exc)
+    env_keys = keys_from_env()
     return {
         "ok": True,
         "ffmpeg": ffmpeg_ok,
         "ffmpeg_error": ffmpeg_err,
         "scene_detection": scene_detection_available(),
         "aspects": available_aspects(),
+        # Backwards compat: true if at least one key is configured
+        "gemini_configured": len(env_keys) > 0,
+        # New: count so the UI can show "3 keys loaded" status
+        "gemini_keys_configured": len(env_keys),
     }
 
 
@@ -113,6 +124,16 @@ async def medal_resolve(request: Request) -> dict:
     return clip.to_json()
 
 
+@app.get("/api/medal/user")
+def medal_user(q: str, limit: int = 50) -> dict:
+    """List a Medal user's public clips from their profile page. No API key required."""
+    try:
+        clips, username = medal_api.list_user_public_clips(q, limit=limit)
+    except medal_api.MedalError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"username": username, "clips": [c.to_json() for c in clips]}
+
+
 # ── YouTube ──────────────────────────────────────────────────────────────────
 
 
@@ -136,14 +157,17 @@ async def create_job(
     music: Optional[UploadFile] = File(None),
     clips: Optional[list[UploadFile]] = File(None),
     duration: float = Form(60.0),
-    intensity: Literal["chill", "balanced", "hype"] = Form("balanced"),
+    intensity: Literal["chill", "balanced", "hype", "auto"] = Form("balanced"),
     aspect: Literal["landscape", "portrait", "square"] = Form("landscape"),
+    game: Literal["valorant_ai", "valorant", "generic"] = Form("valorant"),
     seed: Optional[int] = Form(None),
     medal_clip_ids: Optional[str] = Form(None),
     medal_user_id: Optional[str] = Form(None),
     medal_share_urls: Optional[str] = Form(None),
+    medal_public_clips: Optional[str] = Form(None),
     youtube_url: Optional[str] = Form(None),
     x_medal_key: Optional[str] = Header(None, alias="X-Medal-Key"),
+    x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key"),
 ) -> dict:
     job_id = uuid.uuid4().hex[:12]
     job_dir = JOBS_ROOT / job_id
@@ -153,10 +177,11 @@ async def create_job(
     has_clip_files = bool(clips and any(c and c.filename for c in clips))
     has_medal_library = bool(medal_clip_ids and x_medal_key)
     has_medal_urls = bool(medal_share_urls)
-    if not has_clip_files and not has_medal_library and not has_medal_urls:
+    has_medal_public = bool(medal_public_clips and medal_public_clips.strip() not in ("", "[]"))
+    if not (has_clip_files or has_medal_library or has_medal_urls or has_medal_public):
         raise HTTPException(
             status_code=400,
-            detail="Provide clip files, Medal clip ids (with X-Medal-Key), or Medal share URLs.",
+            detail="Provide clip files, Medal clip ids (with X-Medal-Key), a Medal profile, or Medal share URLs.",
         )
 
     has_music_file = bool(music and music.filename)
@@ -196,9 +221,32 @@ async def create_job(
         intensity=intensity,
         aspect=aspect,
         seed=seed,
+        game=game,
     )
     with JOBS_LOCK:
         JOBS[job_id] = job
+
+    # Combine env-configured keys with any sent on the request. Dedupe while
+    # preserving order so the pool's round-robin stays stable across requests.
+    env_keys = keys_from_env()
+    header_keys = parse_keys(x_gemini_key) if x_gemini_key else []
+    combined_keys: list[str] = []
+    seen: set[str] = set()
+    for k in header_keys + env_keys:
+        if k and k not in seen:
+            combined_keys.append(k)
+            seen.add(k)
+
+    # Parse public-profile clips (full objects, pre-signed MP4s) if any.
+    import json as _json
+    parsed_public_clips: list[dict] = []
+    if medal_public_clips:
+        try:
+            parsed_public_clips = _json.loads(medal_public_clips)
+            if not isinstance(parsed_public_clips, list):
+                parsed_public_clips = []
+        except Exception:
+            parsed_public_clips = []
 
     # Launch worker with anything we still need to fetch (Medal, YT)
     worker_args = {
@@ -209,6 +257,8 @@ async def create_job(
         "duration": float(duration),
         "intensity": intensity,
         "aspect": aspect,
+        "game": game,
+        "gemini_keys": combined_keys,
         "seed": seed,
         "medal_key": x_medal_key,
         "medal_user_id": medal_user_id,
@@ -220,6 +270,7 @@ async def create_job(
             [s.strip() for s in re.split(r"[\n,]+", medal_share_urls) if s.strip()]
             if medal_share_urls else []
         ),
+        "medal_public_clips": parsed_public_clips,
         "youtube_url": youtube_url,
     }
 
@@ -236,11 +287,14 @@ def _run_job(
     duration: float,
     intensity: str,
     aspect: str,
+    game: str,
+    gemini_keys: list[str],
     seed: Optional[int],
     medal_key: Optional[str],
     medal_user_id: Optional[str],
     medal_clip_ids: list[str],
     medal_share_urls: list[str],
+    medal_public_clips: list[dict],
     youtube_url: Optional[str],
 ) -> None:
     def progress(stage: str, frac: float) -> None:
@@ -276,6 +330,22 @@ def _run_job(
                 progress(f"resolving url {i + 1}/{len(medal_share_urls)}", 0.02 + 0.02 * (i / len(medal_share_urls)))
                 medal_clips.append(medal_api.resolve_share_url(url))
 
+        # Public-profile clips: already have pre-signed MP4 URLs, download directly.
+        for obj in medal_public_clips:
+            raw = obj.get("rawFileUrl")
+            if not raw:
+                continue
+            medal_clips.append(medal_api.MedalClip(
+                content_id=str(obj.get("contentId") or ""),
+                title=str(obj.get("title") or "Medal clip"),
+                duration=float(obj.get("duration") or 0.0),
+                thumbnail=str(obj.get("thumbnail") or ""),
+                direct_clip_url=str(obj.get("directClipUrl") or ""),
+                raw_file_url=str(raw),
+                embed_iframe_url=str(obj.get("embedIframeUrl") or ""),
+                created_ms=int(obj.get("createdMs") or 0),
+            ))
+
         for i, clip in enumerate(medal_clips):
             progress(f"downloading clip {i + 1}/{len(medal_clips)}", 0.04 + 0.04 * (i / max(len(medal_clips), 1)))
             medal_api.download_clip(clip, clips_dir)
@@ -298,6 +368,8 @@ def _run_job(
             intensity=intensity,  # type: ignore[arg-type]
             aspect=aspect,  # type: ignore[arg-type]
             seed=seed,
+            game=game,  # type: ignore[arg-type]
+            gemini_api_keys=list(gemini_keys or []),
         )
         with job.lock:
             job.clips_dir = str(clips_dir)
@@ -352,6 +424,7 @@ def reroll_job(job_id: str) -> dict:
         duration = prev.target_duration
         intensity = prev.intensity
         aspect = prev.aspect
+        game = prev.game
     if not clips_dir or not music_path:
         raise HTTPException(status_code=409, detail="original job inputs not available")
     if not Path(clips_dir).exists() or not Path(music_path).exists():
@@ -368,10 +441,12 @@ def reroll_job(job_id: str) -> dict:
         intensity=intensity,
         aspect=aspect,
         seed=new_seed,
+        game=game,
     )
     with JOBS_LOCK:
         JOBS[new_id] = new_job
 
+    reroll_gemini_keys = keys_from_env()
     thread = threading.Thread(
         target=_run_job,
         kwargs={
@@ -382,11 +457,14 @@ def reroll_job(job_id: str) -> dict:
             "duration": duration,
             "intensity": intensity,
             "aspect": aspect,
+            "game": game,
+            "gemini_keys": reroll_gemini_keys,
             "seed": new_seed,
             "medal_key": None,
             "medal_user_id": None,
             "medal_clip_ids": [],
             "medal_share_urls": [],
+            "medal_public_clips": [],
             "youtube_url": None,
         },
         daemon=True,

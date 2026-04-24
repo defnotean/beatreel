@@ -1,83 +1,67 @@
 "use client";
 
-import { BeatVisualizer } from "./BeatVisualizer";
 import type { JobState } from "@/lib/api";
 
 export function ProgressPanel({ job }: { job: JobState }) {
   const pct = Math.round(job.progress * 100);
-  const stages = [
-    { key: "scan", label: "Scanning", threshold: 0.0 },
-    { key: "beats", label: "Beats", threshold: 0.05 },
-    { key: "score", label: "Scoring", threshold: 0.1 },
-    { key: "plan", label: "Planning", threshold: 0.75 },
-    { key: "render", label: "Rendering", threshold: 0.8 },
-  ];
 
   return (
-    <div className="glass rounded-2xl p-8 shadow-glow-lg">
-      <div className="flex items-center justify-between mb-5">
-        <div>
-          <div className="text-[11px] uppercase tracking-[0.18em] text-accent-glow mb-1">
-            in progress
-          </div>
-          <div className="text-lg font-medium">{job.stage}</div>
-        </div>
-        <div className="font-mono text-3xl text-gradient font-semibold tabular-nums">
+    <div className="border border-border bg-surface-1">
+      <header className="flex items-baseline justify-between px-4 py-3 border-b border-border">
+        <span className="font-mono text-[11px] uppercase tracking-[0.12em] text-fg-muted">
+          Job {job.id.slice(0, 8)} · {job.status}
+        </span>
+        <span className="font-mono text-[18px] text-fg tabular-nums">
           {pct}%
-        </div>
-      </div>
+        </span>
+      </header>
 
-      <BeatVisualizer active intensity={0.7 + job.progress * 0.6} />
-
-      <div className="mt-5 h-1.5 rounded-full bg-black/40 overflow-hidden">
+      <div className="px-4 pt-4">
         <div
-          className="h-full bg-accent-gradient transition-all duration-500 shadow-glow"
-          style={{ width: `${pct}%` }}
-        />
-      </div>
-
-      <div className="mt-5 grid grid-cols-5 gap-2">
-        {stages.map((s) => {
-          const active = job.progress >= s.threshold;
-          return (
-            <div key={s.key} className="text-center">
-              <div
-                className={`mx-auto h-1.5 w-1.5 rounded-full mb-1.5 transition-all ${
-                  active
-                    ? "bg-accent-glow shadow-[0_0_10px_rgba(192,132,252,0.9)]"
-                    : "bg-white/15"
-                }`}
-              />
-              <div
-                className={`text-[10.5px] uppercase tracking-wider transition-colors ${
-                  active ? "text-white/80" : "text-white/30"
-                }`}
-              >
-                {s.label}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-
-      {job.num_clips_scanned !== null && (
-        <div className="mt-6 pt-5 border-t border-border grid grid-cols-3 gap-3 text-center">
-          <Stat label="Clips" value={job.num_clips_scanned} />
-          <Stat label="Candidates" value={job.num_candidates ?? "—"} />
-          <Stat label="Tempo" value={job.tempo ? `${Math.round(job.tempo)} BPM` : "—"} />
+          className="font-mono text-[13px] text-fg truncate"
+          title={job.stage}
+        >
+          {job.stage || "queued"}
         </div>
-      )}
+
+        <div className="mt-3 relative h-[6px] bg-bg border border-border">
+          <div
+            className="absolute inset-y-0 left-0 bg-accent transition-[width] duration-300"
+            style={{ width: `${pct}%` }}
+          />
+        </div>
+      </div>
+
+      <dl className="grid grid-cols-4 px-4 py-4 mt-3 gap-x-4 gap-y-3 border-t border-border font-mono text-[11px]">
+        <Stat label="Clips" value={job.num_clips_scanned} />
+        <Stat label="Candidates" value={job.num_candidates} />
+        <Stat
+          label="Cuts"
+          value={job.num_cuts}
+        />
+        <Stat
+          label="Tempo"
+          value={job.tempo !== null ? `${Math.round(job.tempo)} BPM` : null}
+        />
+      </dl>
     </div>
   );
 }
 
-function Stat({ label, value }: { label: string; value: string | number }) {
+function Stat({ label, value }: { label: string; value: string | number | null }) {
+  const empty = value === null || value === undefined;
   return (
-    <div>
-      <div className="font-mono text-lg text-white/90 tabular-nums">{value}</div>
-      <div className="text-[10.5px] uppercase tracking-wider text-white/40 mt-0.5">
-        {label}
-      </div>
+    <div className="flex flex-col gap-0.5">
+      <dt className="uppercase tracking-[0.12em] text-fg-muted">{label}</dt>
+      <dd
+        className={
+          empty
+            ? "text-fg-muted tabular-nums"
+            : "text-fg text-[13px] tabular-nums"
+        }
+      >
+        {empty ? "—" : value}
+      </dd>
     </div>
   );
 }

@@ -33,7 +33,12 @@ export interface YouTubePreview {
   webpage_url: string;
 }
 
-export async function checkHealth(): Promise<{ ok: boolean; ffmpeg: boolean; ffmpeg_error: string | null }> {
+export async function checkHealth(): Promise<{
+  ok: boolean;
+  ffmpeg: boolean;
+  ffmpeg_error: string | null;
+  gemini_configured?: boolean;
+}> {
   const r = await fetch("/api/health");
   if (!r.ok) throw new Error("health check failed");
   return r.json();
@@ -57,6 +62,19 @@ export async function listMedalClips(params: {
   }
   const data = (await r.json()) as { clips: MedalClip[] };
   return data.clips;
+}
+
+export async function listMedalUserClips(
+  q: string,
+  limit = 50,
+): Promise<{ username: string; clips: MedalClip[] }> {
+  const params = new URLSearchParams({ q, limit: String(limit) });
+  const r = await fetch(`/api/medal/user?${params.toString()}`);
+  if (!r.ok) {
+    const detail = await r.json().catch(() => null);
+    throw new Error(detail?.detail || `Medal user: ${r.status}`);
+  }
+  return r.json();
 }
 
 export async function resolveMedalUrl(url: string): Promise<MedalClip> {
@@ -94,6 +112,7 @@ export type ClipSource =
       userId?: string;
       clipIds: string[];
       shareUrls: string[];
+      publicClips?: MedalClip[];
     };
 
 export type MusicSource =
@@ -106,13 +125,17 @@ export async function createJob(params: {
   clips: ClipSource;
   music: MusicSource;
   duration: number;
-  intensity: "chill" | "balanced" | "hype";
+  intensity: "chill" | "balanced" | "hype" | "auto";
   aspect: Aspect;
+  game: "valorant_ai" | "valorant" | "generic";
+  /** One OR MANY Gemini keys. Multiple enables parallel per-clip analysis. */
+  geminiKeys?: string[];
 }): Promise<{ job_id: string }> {
   const fd = new FormData();
   fd.append("duration", String(params.duration));
   fd.append("intensity", params.intensity);
   fd.append("aspect", params.aspect);
+  fd.append("game", params.game);
 
   if (params.clips.type === "upload") {
     for (const c of params.clips.files) fd.append("clips", c);
@@ -122,6 +145,9 @@ export async function createJob(params: {
     }
     if (params.clips.shareUrls.length > 0) {
       fd.append("medal_share_urls", params.clips.shareUrls.join("\n"));
+    }
+    if (params.clips.publicClips && params.clips.publicClips.length > 0) {
+      fd.append("medal_public_clips", JSON.stringify(params.clips.publicClips));
     }
     if (params.clips.userId) fd.append("medal_user_id", params.clips.userId);
   }
@@ -135,6 +161,10 @@ export async function createJob(params: {
   const headers: Record<string, string> = {};
   if (params.clips.type === "medal" && params.clips.apiKey) {
     headers["X-Medal-Key"] = params.clips.apiKey;
+  }
+  if (params.geminiKeys && params.geminiKeys.length > 0) {
+    // Backend parses comma/newline-separated keys out of the header value.
+    headers["X-Gemini-Key"] = params.geminiKeys.join(",");
   }
 
   const r = await fetch("/api/jobs", { method: "POST", body: fd, headers });

@@ -8,16 +8,23 @@ import {
   Loader2,
   RefreshCw,
   Trash2,
+  User,
   X,
-  Zap,
 } from "lucide-react";
 import { cn } from "@/lib/cn";
-import { listMedalClips, resolveMedalUrl, type MedalClip } from "@/lib/api";
+import {
+  listMedalClips,
+  listMedalUserClips,
+  resolveMedalUrl,
+  type MedalClip,
+} from "@/lib/api";
 import { loadMedalSettings } from "@/lib/settings";
 
 export function MedalPicker({
   librarySelected,
   onLibraryChange,
+  profileSelected,
+  onProfileSelectedChange,
   urlClips,
   onUrlClipsChange,
   onOpenSettings,
@@ -25,16 +32,60 @@ export function MedalPicker({
 }: {
   librarySelected: Set<string>;
   onLibraryChange: (next: Set<string>) => void;
+  profileSelected: MedalClip[];
+  onProfileSelectedChange: (clips: MedalClip[]) => void;
   urlClips: MedalClip[];
   onUrlClipsChange: (clips: MedalClip[]) => void;
   onOpenSettings: () => void;
   reloadKey: number;
 }) {
+  const profileSelectedIds = new Set(profileSelected.map((c) => c.contentId));
+
+  function toggleProfile(clip: MedalClip) {
+    if (profileSelectedIds.has(clip.contentId)) {
+      onProfileSelectedChange(profileSelected.filter((c) => c.contentId !== clip.contentId));
+    } else {
+      onProfileSelectedChange([...profileSelected, clip]);
+    }
+  }
+  // ── Public profile (username / URL) ────────────────────────────────────
+  const [profileInput, setProfileInput] = useState("");
+  const [profileClips, setProfileClips] = useState<MedalClip[] | null>(null);
+  const [profileUsername, setProfileUsername] = useState<string | null>(null);
+  const [profileLoading, setProfileLoading] = useState(false);
+  const [profileError, setProfileError] = useState<string | null>(null);
+
+  async function loadProfile() {
+    const q = profileInput.trim();
+    if (!q) return;
+    setProfileLoading(true);
+    setProfileError(null);
+    try {
+      const r = await listMedalUserClips(q);
+      setProfileClips(r.clips.map((c) => ({ ...c, origin: "library" as const })));
+      setProfileUsername(r.username);
+    } catch (e) {
+      setProfileError(e instanceof Error ? e.message : String(e));
+      setProfileClips(null);
+    } finally {
+      setProfileLoading(false);
+    }
+  }
+
+  function clearProfile() {
+    setProfileClips(null);
+    setProfileUsername(null);
+    setProfileInput("");
+    setProfileError(null);
+  }
+
+  // ── Authenticated library (API key) ────────────────────────────────────
   const [hasKey, setHasKey] = useState(false);
-  const [clips, setClips] = useState<MedalClip[] | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [libClips, setLibClips] = useState<MedalClip[] | null>(null);
+  const [libLoading, setLibLoading] = useState(false);
   const [libraryError, setLibraryError] = useState<string | null>(null);
 
+  // ── Share-URL single clip ──────────────────────────────────────────────
   const [urlInput, setUrlInput] = useState("");
   const [urlBusy, setUrlBusy] = useState(false);
   const [urlError, setUrlError] = useState<string | null>(null);
@@ -43,19 +94,19 @@ export function MedalPicker({
     const { apiKey, userId } = loadMedalSettings();
     setHasKey(!!apiKey);
     if (!apiKey) {
-      setClips(null);
+      setLibClips(null);
       return;
     }
-    setLoading(true);
+    setLibLoading(true);
     setLibraryError(null);
     try {
       const cs = await listMedalClips({ apiKey, userId: userId || undefined, limit: 50 });
-      setClips(cs.map((c) => ({ ...c, origin: "library" as const })));
+      setLibClips(cs.map((c) => ({ ...c, origin: "library" as const })));
     } catch (e) {
       setLibraryError(e instanceof Error ? e.message : String(e));
-      setClips([]);
+      setLibClips([]);
     } finally {
-      setLoading(false);
+      setLibLoading(false);
     }
   }
 
@@ -98,27 +149,101 @@ export function MedalPicker({
     onUrlClipsChange([]);
   }
 
+  // The profile clips replace the library display when loaded; the key-based
+  // library remains available if the user has a Medal API key saved.
+  const showingProfile = profileClips !== null;
+  const activeClips = showingProfile ? profileClips : libClips;
+
   return (
     <div className="space-y-5">
-      {/* Share URL section — always available */}
-      <div>
+      {/* ── Username / profile URL ───────────────────────────────────── */}
+      <section>
         <div className="flex items-center justify-between mb-2">
-          <span className="text-[11px] uppercase tracking-[0.18em] text-accent-glow">
-            paste medal share url
+          <span className="font-mono text-[10.5px] uppercase tracking-[0.12em] text-fg-muted">
+            Profile — username or URL
+          </span>
+          {showingProfile && (
+            <button
+              onClick={clearProfile}
+              className="flex items-center gap-1 font-mono text-[10.5px] uppercase tracking-[0.12em] text-fg-muted hover:text-err"
+            >
+              <X className="h-3 w-3" />
+              Clear
+            </button>
+          )}
+        </div>
+        <div className="flex gap-0">
+          <div className="relative flex-1">
+            <User className="absolute left-3 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-fg-muted" />
+            <input
+              type="text"
+              value={profileInput}
+              onChange={(e) => setProfileInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  loadProfile();
+                }
+              }}
+              placeholder="defnotean  or  https://medal.tv/u/defnotean"
+              className={cn(
+                "w-full bg-surface-1 border border-border border-r-0 pl-9 pr-3 py-2",
+                "font-mono text-[12px] text-fg placeholder:text-fg-muted",
+                "focus:border-accent focus:outline-none",
+              )}
+              disabled={profileLoading}
+            />
+          </div>
+          <button
+            onClick={loadProfile}
+            disabled={profileLoading || !profileInput.trim()}
+            className={cn(
+              "px-4 font-mono text-[11px] uppercase tracking-[0.1em] border",
+              profileLoading || !profileInput.trim()
+                ? "border-border bg-surface-1 text-fg-muted cursor-not-allowed"
+                : "border-accent bg-accent text-white hover:brightness-110",
+            )}
+          >
+            {profileLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Load"}
+          </button>
+        </div>
+        {profileError && (
+          <div className="mt-2 border border-err/50 bg-err/5 px-3 py-2 font-mono text-[11px] text-err break-all">
+            {profileError}
+          </div>
+        )}
+        {showingProfile && profileUsername && (
+          <div className="mt-2 font-mono text-[10.5px] text-fg-dim uppercase tracking-[0.1em]">
+            {profileClips!.length} public clip{profileClips!.length === 1 ? "" : "s"} from{" "}
+            <span className="text-fg">{profileUsername}</span>
+            {profileSelected.length > 0 && (
+              <span className="ml-2 text-accent">
+                · {profileSelected.length} selected
+              </span>
+            )}
+          </div>
+        )}
+      </section>
+
+      {/* ── Share URL (single clip) ──────────────────────────────────── */}
+      <section>
+        <div className="flex items-center justify-between mb-2">
+          <span className="font-mono text-[10.5px] uppercase tracking-[0.12em] text-fg-muted">
+            Add single clip by URL
           </span>
           {urlClips.length > 0 && (
             <button
               onClick={clearAllUrls}
-              className="flex items-center gap-1 text-[11.5px] text-white/40 hover:text-red-300 transition-colors"
+              className="flex items-center gap-1 font-mono text-[10.5px] uppercase tracking-[0.12em] text-fg-muted hover:text-err"
             >
               <Trash2 className="h-3 w-3" />
               Clear
             </button>
           )}
         </div>
-        <div className="flex gap-2">
+        <div className="flex gap-0">
           <div className="relative flex-1">
-            <Link2 className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-white/30" />
+            <Link2 className="absolute left-3 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-fg-muted" />
             <input
               type="url"
               value={urlInput}
@@ -129,11 +254,11 @@ export function MedalPicker({
                   addUrl();
                 }
               }}
-              placeholder="https://medal.tv/..."
+              placeholder="https://medal.tv/clips/..."
               className={cn(
-                "w-full bg-black/40 border border-border rounded-lg pl-10 pr-3 py-2.5",
-                "text-[13px] font-mono placeholder:text-white/20",
-                "focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/30",
+                "w-full bg-surface-1 border border-border border-r-0 pl-9 pr-3 py-2",
+                "font-mono text-[12px] text-fg placeholder:text-fg-muted",
+                "focus:border-accent focus:outline-none",
               )}
               disabled={urlBusy}
             />
@@ -142,23 +267,23 @@ export function MedalPicker({
             onClick={addUrl}
             disabled={urlBusy || !urlInput.trim()}
             className={cn(
-              "px-4 rounded-lg text-[13px] font-medium transition-all",
+              "px-4 font-mono text-[11px] uppercase tracking-[0.1em] border",
               urlBusy || !urlInput.trim()
-                ? "bg-white/5 text-white/30 cursor-not-allowed"
-                : "bg-accent-gradient text-white shadow-glow hover:shadow-glow-lg",
+                ? "border-border bg-surface-1 text-fg-muted cursor-not-allowed"
+                : "border-accent bg-accent text-white hover:brightness-110",
             )}
           >
-            {urlBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : "Add"}
+            {urlBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Add"}
           </button>
         </div>
         {urlError && (
-          <div className="mt-2 rounded-lg border border-red-500/30 bg-red-500/5 px-3 py-2 text-[12px] text-red-300">
+          <div className="mt-2 border border-err/50 bg-err/5 px-3 py-2 font-mono text-[11px] text-err break-all">
             {urlError}
           </div>
         )}
 
         {urlClips.length > 0 && (
-          <div className="mt-3 grid grid-cols-2 md:grid-cols-3 gap-3">
+          <div className="mt-3 grid grid-cols-2 md:grid-cols-3 gap-2">
             {urlClips.map((c) => (
               <ClipCard
                 key={c.contentId}
@@ -170,89 +295,96 @@ export function MedalPicker({
             ))}
           </div>
         )}
-      </div>
+      </section>
 
-      {/* Library section */}
-      <div>
-        <div className="flex items-center justify-between mb-3">
-          <div className="flex items-baseline gap-2">
-            <span className="text-[11px] uppercase tracking-[0.18em] text-accent-glow">
-              your library
+      {/* ── Active clip grid: profile-loaded OR API-key library ───── */}
+      <section>
+        <div className="flex items-center justify-between mb-2">
+          <div className="flex items-baseline gap-2 font-mono text-[10.5px] uppercase tracking-[0.12em]">
+            <span className="text-fg-muted">
+              {showingProfile ? "Clips" : "Library (API key)"}
             </span>
-            {clips && (
-              <span className="text-[11.5px] text-white/40">
-                · {clips.length} clip{clips.length === 1 ? "" : "s"}
+            {!showingProfile && libClips && (
+              <span className="text-fg-dim tabular-nums">
+                {libClips.length}
                 {librarySelected.size > 0 && (
-                  <span className="ml-1 text-accent-glow">
-                    ({librarySelected.size} selected)
+                  <span className="ml-1 text-accent">
+                    · {librarySelected.size} selected
                   </span>
                 )}
               </span>
             )}
           </div>
-          {hasKey && (
+          {!showingProfile && hasKey && (
             <button
               onClick={loadLibrary}
-              disabled={loading}
-              className="flex items-center gap-1.5 text-[12px] text-white/50 hover:text-white transition-colors disabled:opacity-40"
+              disabled={libLoading}
+              className="flex items-center gap-1 font-mono text-[10.5px] uppercase tracking-[0.12em] text-fg-muted hover:text-fg disabled:opacity-40"
             >
-              <RefreshCw className={cn("h-3.5 w-3.5", loading && "animate-spin")} />
+              <RefreshCw className={cn("h-3 w-3", libLoading && "animate-spin")} />
               Refresh
             </button>
           )}
         </div>
 
-        {!hasKey && (
-          <div className="rounded-xl border border-dashed border-border p-6 text-center">
-            <div className="mx-auto mb-3 inline-flex rounded-xl bg-white/5 p-2.5 text-white/50">
-              <Key className="h-4 w-4" />
+        {!showingProfile && !hasKey && (
+          <div className="border border-dashed border-border p-6 text-center">
+            <Key className="h-4 w-4 text-fg-muted mx-auto mb-2" />
+            <div className="text-[12.5px] text-fg mb-1">
+              Browse any user's clips with the field above
             </div>
-            <div className="text-[13.5px] font-medium text-white/80 mb-1">
-              Browse your full library
-            </div>
-            <div className="text-[12.5px] text-white/45 max-w-sm mx-auto mb-4">
-              Add your Medal API key in settings to list and multi-select your own clips.
+            <div className="text-[11.5px] text-fg-dim max-w-sm mx-auto mb-3">
+              Or add your own Medal API key to list your full private library.
             </div>
             <button
               onClick={onOpenSettings}
-              className="px-3.5 py-2 rounded-lg bg-accent-gradient text-white text-[12.5px] font-medium shadow-glow hover:shadow-glow-lg transition-all"
+              className="px-4 py-2 bg-surface-2 border border-border text-fg font-mono text-[11px] uppercase tracking-[0.1em] hover:border-border-strong"
             >
               Open settings
             </button>
           </div>
         )}
 
-        {libraryError && (
-          <div className="mb-3 rounded-lg border border-red-500/30 bg-red-500/5 p-3 text-[12.5px] text-red-300">
+        {!showingProfile && libraryError && (
+          <div className="mb-2 border border-err/50 bg-err/5 px-3 py-2 font-mono text-[11px] text-err break-all">
             {libraryError}
           </div>
         )}
 
-        {hasKey && loading && !clips && (
-          <div className="flex items-center justify-center h-48 rounded-xl bg-black/20 border border-border">
-            <Loader2 className="h-5 w-5 text-accent-glow animate-spin" />
+        {!showingProfile && hasKey && libLoading && !libClips && (
+          <div className="flex items-center justify-center h-40 border border-border bg-surface-1">
+            <Loader2 className="h-4 w-4 text-fg-dim animate-spin" />
           </div>
         )}
 
-        {hasKey && clips && clips.length === 0 && !loading && (
-          <div className="rounded-xl border border-border p-6 text-center text-[13px] text-white/50">
-            No clips found. Check your API key and user ID.
+        {activeClips && activeClips.length === 0 && !profileLoading && !libLoading && (
+          <div className="border border-border bg-surface-1 p-6 text-center text-[12px] text-fg-dim">
+            No clips found.
           </div>
         )}
 
-        {hasKey && clips && clips.length > 0 && (
-          <div className="grid grid-cols-2 md:grid-cols-3 gap-3 max-h-[420px] overflow-y-auto pr-1 -mr-1">
-            {clips.map((c) => (
-              <ClipCard
-                key={c.contentId}
-                clip={c}
-                checked={librarySelected.has(c.contentId)}
-                onToggle={() => toggleLibrary(c.contentId)}
-              />
-            ))}
+        {activeClips && activeClips.length > 0 && (
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-2 max-h-[420px] overflow-y-auto">
+            {activeClips.map((c) =>
+              showingProfile ? (
+                <ClipCard
+                  key={c.contentId}
+                  clip={c}
+                  checked={profileSelectedIds.has(c.contentId)}
+                  onToggle={() => toggleProfile(c)}
+                />
+              ) : (
+                <ClipCard
+                  key={c.contentId}
+                  clip={c}
+                  checked={librarySelected.has(c.contentId)}
+                  onToggle={() => toggleLibrary(c.contentId)}
+                />
+              )
+            )}
           </div>
         )}
-      </div>
+      </section>
     </div>
   );
 }
@@ -282,11 +414,10 @@ function ClipCard({
       type="button"
       onClick={onToggle}
       className={cn(
-        "group relative block rounded-xl overflow-hidden border transition-all text-left",
-        "aspect-video bg-black/60",
+        "group relative block overflow-hidden border text-left aspect-video bg-black transition-colors",
         checked
-          ? "border-accent shadow-glow ring-2 ring-accent/40"
-          : "border-border hover:border-accent/50",
+          ? "border-accent"
+          : "border-border hover:border-border-strong",
       )}
     >
       {clip.thumbnail ? (
@@ -294,48 +425,37 @@ function ClipCard({
         <img
           src={clip.thumbnail}
           alt={clip.title}
-          className="h-full w-full object-cover transition-transform group-hover:scale-[1.03]"
+          className="h-full w-full object-cover"
           loading="lazy"
         />
       ) : (
-        <div className="flex h-full w-full items-center justify-center bg-gradient-to-br from-accent/20 to-accent-secondary/10">
-          <Zap className="h-6 w-6 text-accent-glow" />
-        </div>
+        <div className="flex h-full w-full items-center justify-center bg-surface-2" />
       )}
 
-      <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/95 via-black/50 to-transparent p-2.5">
-        <div className="truncate text-[12px] font-medium text-white/95">
+      <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/90 to-transparent p-2">
+        <div className="truncate text-[11.5px] text-fg">
           {clip.title}
         </div>
-        <div className="flex items-center justify-between text-[10.5px] text-white/60 mt-0.5 font-mono">
+        <div className="flex items-center justify-between font-mono text-[10px] text-fg-dim mt-0.5 tabular-nums">
           <span>{durLabel}</span>
-          <span
-            className={cn(
-              "uppercase tracking-wider",
-              clip.origin === "url" ? "text-accent-glow" : "text-white/40",
-            )}
-          >
-            {clip.origin === "url" ? "url" : clip.rawFileUrl ? "api" : "scrape"}
+          <span className="uppercase tracking-[0.08em] text-fg-muted">
+            {clip.origin === "url" ? "url" : clip.rawFileUrl ? "direct" : "scrape"}
           </span>
         </div>
       </div>
 
       <div
         className={cn(
-          "absolute top-2 right-2 flex h-6 w-6 items-center justify-center rounded-full transition-all",
+          "absolute top-1.5 right-1.5 flex h-5 w-5 items-center justify-center transition-opacity",
           checked
             ? removable
-              ? "bg-red-500/90 shadow-[0_0_12px_rgba(239,68,68,0.6)]"
-              : "bg-accent-gradient shadow-glow"
-            : "bg-black/60 border border-white/20 opacity-0 group-hover:opacity-100",
+              ? "bg-err text-white"
+              : "bg-accent text-white"
+            : "bg-black/60 border border-border-strong opacity-0 group-hover:opacity-100",
         )}
       >
         {checked ? (
-          removable ? (
-            <X className="h-3.5 w-3.5 text-white" />
-          ) : (
-            <Check className="h-3.5 w-3.5 text-white" />
-          )
+          removable ? <X className="h-3 w-3" /> : <Check className="h-3 w-3" />
         ) : null}
       </div>
     </button>
