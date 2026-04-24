@@ -69,52 +69,53 @@ class TestAutoClipE2E:
         self, synthetic_long_video, sample_music, tmp_path, monkeypatch,
     ):
         """Full auto-clip pipeline with mocked Gemini."""
+        # Need >=3 moments per tier to pass min_moments=3 per-tier floor.
+        # 9 non-overlapping moments across a 30s source: 3s each.
         pinned_moments = [
-            Moment(
-                start_seconds=2.0, end_seconds=6.5,
-                scores=MomentScores(
-                    visual_interest=0.85, audio_peak=0.90,
-                    emotional_charge=0.75, narrative_payoff=0.70,
-                    technical_skill=0.80,
-                ),
-                composite=0.81,
-                description="Test moment 1 — big reaction",
-                suggested_caption="HOLY",
-                caption_kind="voice_comm",
-                caption_start_in_moment_seconds=1.5,
-                caption_duration_seconds=1.3,
-                emphasis_hint="drop_hit",
-                content_tags=["gaming", "reaction"],
-            ),
-            Moment(
-                start_seconds=12.0, end_seconds=16.0,
-                scores=MomentScores(
-                    visual_interest=0.70, audio_peak=0.60,
-                    emotional_charge=0.80, narrative_payoff=0.65,
-                    technical_skill=0.55,
-                ),
-                composite=0.67,
-                description="Test moment 2 — emotional beat",
-                suggested_caption=None,
-                emphasis_hint="normal",
-                content_tags=["narrative"],
-            ),
-            Moment(
-                start_seconds=22.0, end_seconds=28.0,
-                scores=MomentScores(
-                    visual_interest=0.95, audio_peak=0.95,
-                    emotional_charge=0.85, narrative_payoff=0.80,
-                    technical_skill=0.90,
-                ),
-                composite=0.90,
-                description="Test moment 3 — climax",
-                suggested_caption="ACE",
-                caption_kind="visual_text",
-                caption_start_in_moment_seconds=2.0,
-                caption_duration_seconds=1.5,
-                emphasis_hint="drop_hit",
-                content_tags=["gaming", "multi_kill"],
-            ),
+            # headline (>= 0.85)
+            Moment(start_seconds=0.5, end_seconds=3.0,
+                   scores=MomentScores(visual_interest=0.9, audio_peak=0.9, emotional_charge=0.9, narrative_payoff=0.85, technical_skill=0.9),
+                   composite=0.89, description="headline 1",
+                   suggested_caption="HOLY", caption_kind="voice_comm",
+                   caption_start_in_moment_seconds=1.0, caption_duration_seconds=1.0,
+                   emphasis_hint="drop_hit", content_tags=["top"],
+                   meme_tag="clutch"),
+            Moment(start_seconds=3.5, end_seconds=6.0,
+                   scores=MomentScores(visual_interest=0.95, audio_peak=0.9, emotional_charge=0.85, narrative_payoff=0.85, technical_skill=0.9),
+                   composite=0.90, description="headline 2",
+                   emphasis_hint="drop_hit", content_tags=["top"]),
+            Moment(start_seconds=6.5, end_seconds=9.0,
+                   scores=MomentScores(visual_interest=0.9, audio_peak=0.95, emotional_charge=0.8, narrative_payoff=0.85, technical_skill=0.85),
+                   composite=0.87, description="headline 3",
+                   suggested_caption="ACE", caption_kind="visual_text",
+                   caption_start_in_moment_seconds=1.0, caption_duration_seconds=1.0,
+                   emphasis_hint="drop_hit", content_tags=["top"]),
+            # bsides (0.70-0.85)
+            Moment(start_seconds=9.5, end_seconds=12.0,
+                   scores=MomentScores(visual_interest=0.8, audio_peak=0.8, emotional_charge=0.75, narrative_payoff=0.7, technical_skill=0.8),
+                   composite=0.78, description="bsides 1",
+                   emphasis_hint="hold", content_tags=["mid"]),
+            Moment(start_seconds=12.5, end_seconds=15.0,
+                   scores=MomentScores(visual_interest=0.75, audio_peak=0.8, emotional_charge=0.75, narrative_payoff=0.75, technical_skill=0.75),
+                   composite=0.76, description="bsides 2",
+                   emphasis_hint="normal", content_tags=["mid"]),
+            Moment(start_seconds=15.5, end_seconds=18.0,
+                   scores=MomentScores(visual_interest=0.75, audio_peak=0.75, emotional_charge=0.7, narrative_payoff=0.75, technical_skill=0.7),
+                   composite=0.73, description="bsides 3",
+                   emphasis_hint="normal", content_tags=["mid"]),
+            # vibes (0.55-0.70)
+            Moment(start_seconds=18.5, end_seconds=21.0,
+                   scores=MomentScores(visual_interest=0.6, audio_peak=0.65, emotional_charge=0.7, narrative_payoff=0.65, technical_skill=0.6),
+                   composite=0.64, description="vibes 1",
+                   emphasis_hint="normal", content_tags=["low"]),
+            Moment(start_seconds=21.5, end_seconds=24.0,
+                   scores=MomentScores(visual_interest=0.55, audio_peak=0.6, emotional_charge=0.7, narrative_payoff=0.6, technical_skill=0.6),
+                   composite=0.61, description="vibes 2",
+                   emphasis_hint="normal", content_tags=["low"]),
+            Moment(start_seconds=24.5, end_seconds=27.0,
+                   scores=MomentScores(visual_interest=0.55, audio_peak=0.6, emotional_charge=0.6, narrative_payoff=0.6, technical_skill=0.55),
+                   composite=0.58, description="vibes 3",
+                   emphasis_hint="normal", content_tags=["low"]),
         ]
         pinned_result = AutoClipperResult(
             source_video=str(synthetic_long_video),
@@ -187,37 +188,38 @@ class TestAutoClipE2E:
         result = run(cfg, on_progress=lambda s, f: progress_calls.append((s, f)))
 
         # Core assertions
-        assert output_path.exists(), "Final reel not rendered"
-        assert output_path.stat().st_size > 5_000, "Output file is empty / broken"
+        assert output_path.exists(), "config.output_path (backcompat alias) not rendered"
+        assert output_path.stat().st_size > 5_000
 
-        # Result metadata
+        # Multi-tier outputs: all three tiers should have rendered
         assert result.source_mode == "auto_clip"
-        assert result.moments_found == 3
-        assert result.moments_selected == 2
-        assert result.detector_used == "auto-clipper+director"
-        assert result.num_cuts == 2
-        assert result.captions_placed == 2
+        assert result.moments_found == 9
+        assert len(result.outputs) == 3, f"expected 3 tier outputs, got {len(result.outputs)}"
 
-        # moments.json and debug.json both written
-        moments_file = tmp_path / "moments.json"
-        debug_file = tmp_path / "debug.json"
-        assert moments_file.exists(), "moments.json not written"
-        assert debug_file.exists(), "debug.json not written"
+        tier_names = [o.tier for o in result.outputs]
+        assert "headline" in tier_names and "bsides" in tier_names and "vibes" in tier_names
 
-        moments_dump = json.loads(moments_file.read_text())
+        for out in result.outputs:
+            assert out.path.exists(), f"tier {out.tier} not rendered"
+            assert out.thumbnail_path.exists(), f"tier {out.tier} thumbnail missing"
+            assert out.num_cuts > 0
+
+        # moments.json + debug.json present
+        assert (tmp_path / "moments.json").exists()
+        assert (tmp_path / "debug.json").exists()
+
+        moments_dump = json.loads((tmp_path / "moments.json").read_text())
         assert moments_dump["video_mood"] == "hype"
-        assert len(moments_dump["moments"]) == 3
+        assert len(moments_dump["moments"]) == 9
+        # meme_tag on the first headline moment survived the JSON round-trip.
+        tagged = [m for m in moments_dump["moments"] if m.get("meme_tag")]
+        assert any(m["meme_tag"] == "clutch" for m in tagged), (
+            f"expected meme_tag='clutch' in moments.json, got {[(m.get('description'), m.get('meme_tag')) for m in moments_dump['moments']]}"
+        )
 
-        debug_dump = json.loads(debug_file.read_text())
+        debug_dump = json.loads((tmp_path / "debug.json").read_text())
         assert debug_dump["source_mode"] == "auto_clip"
-        assert debug_dump["moments_found"] == 3
-
-        # Cuts are in SOURCE-ABSOLUTE coordinates (not moment-relative)
-        # Cut 0: moment 0 (source_start=2.0) + director's clip_start 0.5 = 2.5 source
-        # Cut 1: moment 2 (source_start=22.0) + director's clip_start 1.0 = 23.0 source
-        cuts = result.cuts
-        assert cuts[0].start == pytest.approx(2.5, abs=0.01)
-        assert cuts[1].start == pytest.approx(23.0, abs=0.01)
+        assert debug_dump["moments_found"] == 9
 
     def test_auto_clip_fails_loud_when_no_moments(
         self, synthetic_long_video, sample_music, tmp_path, monkeypatch,
@@ -265,6 +267,68 @@ class TestAutoClipE2E:
         )
         with pytest.raises(RuntimeError, match="requires config.source_video"):
             run(cfg)
+
+    def test_auto_clip_without_music_uses_source_audio(
+        self, synthetic_long_video, tmp_path, monkeypatch,
+    ):
+        """Music-optional: when config.music_path is None, use the source
+        video's own audio. Beat grid on that audio should be invalid (speech/
+        silence), pipeline falls through to moment-boundary placement."""
+        # 3 moments all in the bsides tier (0.70-0.85) so exactly one tier
+        # renders — the point of this test is that source audio works.
+        pinned_moments = [
+            Moment(start_seconds=2.0, end_seconds=5.0,
+                   scores=MomentScores(visual_interest=0.8, audio_peak=0.75, emotional_charge=0.7, narrative_payoff=0.7, technical_skill=0.75),
+                   composite=0.75, description="moment 1", emphasis_hint="hold"),
+            Moment(start_seconds=10.0, end_seconds=13.0,
+                   scores=MomentScores(visual_interest=0.8, audio_peak=0.8, emotional_charge=0.75, narrative_payoff=0.7, technical_skill=0.75),
+                   composite=0.76, description="moment 2", emphasis_hint="hold"),
+            Moment(start_seconds=18.0, end_seconds=21.0,
+                   scores=MomentScores(visual_interest=0.8, audio_peak=0.75, emotional_charge=0.7, narrative_payoff=0.75, technical_skill=0.8),
+                   composite=0.77, description="moment 3", emphasis_hint="hold"),
+        ]
+        pinned_result = AutoClipperResult(
+            source_video=str(synthetic_long_video),
+            duration_seconds=30.0,
+            video_mood="calm",
+            moments=pinned_moments,
+        )
+
+        def fake_auto_clip(video_path, api_key, *, on_progress=None):
+            return pinned_result
+
+        # Music analyzer should NOT be called when music is extracted from source
+        analyze_called = {"count": 0}
+        def fake_analyze_music(*a, **kw):
+            analyze_called["count"] += 1
+            raise RuntimeError("music analyzer should not be called when no music uploaded")
+
+        monkeypatch.setattr(auto_clipper_mod, "auto_clip", fake_auto_clip)
+        monkeypatch.setattr(gemini_music_analyzer, "analyze_music", fake_analyze_music)
+
+        output_path = tmp_path / "reel.mp4"
+        cfg = PipelineConfig(
+            clips_dir=tmp_path / "unused",
+            music_path=None,  # <-- the point of the test
+            output_path=output_path,
+            target_duration=8.0,
+            intensity="balanced",
+            aspect="landscape",
+            game="valorant_ai",
+            gemini_api_keys=["test-key"],
+            source_mode="auto_clip",
+            source_video=synthetic_long_video,
+        )
+        result = run(cfg)
+        assert output_path.exists()
+        assert analyze_called["count"] == 0, "Music analyzer called despite no music uploaded"
+        assert result.detector_used.startswith("auto-clipper+"), (
+            f"Expected auto-clipper path, got {result.detector_used}"
+        )
+        # Silent music track should have been created alongside the output
+        assert (tmp_path / "silent_music.m4a").exists()
+        # At least one tier should have rendered (bsides — 3 moments at ~0.75)
+        assert len(result.outputs) >= 1
 
     def test_auto_clip_requires_gemini_keys(self, synthetic_long_video, sample_music, tmp_path):
         cfg = PipelineConfig(

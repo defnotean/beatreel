@@ -94,6 +94,23 @@ class Moment(BaseModel):
         default_factory=list,
         description="Short descriptive tags like ['gaming','multi_kill','voice_reaction'] or ['cooking','close_up','reaction']. Free-form; used for observability.",
     )
+    meme_tag: Optional[Literal[
+        "shock", "surprise", "clutch", "fail", "victory",
+        "hype", "emotional", "cringe", "weird",
+    ]] = Field(
+        default=None,
+        description=(
+            "Optional meme-style visual stamp that matches the moment's "
+            "emotional register. The renderer overlays a stylized text stamp "
+            "for the first ~1.5s of the cut. Leave null for at least 60% of "
+            "moments — stamps lose impact if every cut has one. Pick: "
+            "shock (jaw-drop outcome), surprise (unexpected turn), "
+            "clutch (last-second win under pressure), fail (public mess-up), "
+            "victory (clean decisive win), hype (peak energy / crowd-level), "
+            "emotional (quiet heartfelt beat), cringe (awkward / painful), "
+            "weird (surreal / inexplicable)."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate(self) -> "Moment":
@@ -176,6 +193,15 @@ SYSTEM_INSTRUCTION = (
     "- One word summarizing the VOD's overall energy: hype (competitive gaming/sports), "
     "  calm (vlog, lo-fi content), varied (mixed stream), narrative (story-driven), "
     "  emotional (heart-heavy content). Drives music pairing.\n\n"
+    "MEME STAMP (optional)\n"
+    "- Set meme_tag to flag the moment for a stylized text-stamp overlay. Only set for "
+    "  the strongest emotional beats — leave null for AT LEAST 60% of moments. Stamps "
+    "  lose impact if every cut has one.\n"
+    "- Choose from: shock (jaw-drop outcome), surprise (unexpected turn), clutch "
+    "  (last-second win under pressure), fail (public mess-up or whiff), victory "
+    "  (clean decisive win), hype (peak energy beat, crowd-level), emotional (quiet "
+    "  heartfelt), cringe (awkward / painful), weird (surreal / inexplicable). Null "
+    "  when nothing fits strongly — don't force a tag.\n\n"
     "Prefer fewer high-quality moments over many lukewarm ones. Be ruthless."
 )
 
@@ -331,5 +357,6 @@ def moments_to_clip_summaries(
             "emphasis_hint": m.emphasis_hint,
             "content_tags": m.content_tags,
             "composite_score": m.composite,
+            "meme_tag": m.meme_tag,
         })
     return summaries

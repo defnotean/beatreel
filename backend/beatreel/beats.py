@@ -41,6 +41,23 @@ class BeatGrid:
         mask = (self.beat_times >= start) & (self.beat_times <= end)
         return self.beat_times[mask]
 
+    def is_valid(self) -> bool:
+        """Whether this beat grid looks like genuine music beats.
+
+        librosa happily returns garbage when run against speech / silence /
+        non-musical audio — it'll detect phantom tempos under 60 or over 200
+        BPM and produce sparse / dense beat timelines that don't correspond
+        to anything a human would beat-match to. For music-optional mode
+        where we extract the source video's original audio and run beat
+        detection on that, we need to know whether to trust the result or
+        fall back to moment-boundary placement.
+        """
+        if not (60.0 <= self.tempo <= 200.0):
+            return False
+        if len(self.beat_times) < 5:
+            return False
+        return True
+
 
 def _detect_bass_onsets(y: np.ndarray, sr: int, hop_length: int = 512) -> np.ndarray:
     """Timestamps of peaks in low-band (60-250 Hz) onset strength.

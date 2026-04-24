@@ -31,6 +31,10 @@ class CutPlan:
     # "drop_hit" = ramp + flash + zoom pulse.
     emphasis: str = "normal"  # Literal["normal", "hold", "drop_hit"]
 
+    # Optional meme-style stamp overlay keyed into MEME_STAMPS.
+    # Set by the auto-clipper from Gemini's per-moment meme_tag. None = no stamp.
+    meme_tag: Optional[str] = None
+
 
 # ─── Color grades ─────────────────────────────────────────────────────────
 # Expressed as ffmpeg filter chains rather than 3D LUT files. Tradeoff:
@@ -84,6 +88,27 @@ RAMP_MIN_CUT_S = 1.4  # sub-1.4s cuts have no room for a meaningful ramp
 IMPACT_BURST_FLASH_S = 0.06   # ~3-4 frames of white flash
 IMPACT_BURST_ZOOM_S = 0.35    # full zoom-pulse window (ramp up + settle)
 IMPACT_BURST_ZOOM_MAX = 1.08  # 108% peak zoom
+
+# ─── Meme-style stamps ───────────────────────────────────────────────────
+# Context-matching text overlays keyed to each moment's emotional register.
+# Shipped as drawtext specs (not PNG assets) so:
+#   (1) no copyrighted-meme-image baggage,
+#   (2) no binary growth in the repo,
+#   (3) fonts + text scale with aspect ratio automatically.
+# Each entry: text, size divisor (h/<size>), fill color, outline color, y-pos,
+# and whether the stamp jitters (for unstable-feeling emotional registers).
+# "calm" is intentionally absent — a calm moment should NOT get a stamp.
+MEME_STAMPS: dict[str, dict] = {
+    "shock":     {"text": "?!?!",       "size": 5.5, "fill": "white",    "outline": "red",    "y": "h*0.35", "jitter": True},
+    "surprise":  {"text": "WHAT",       "size": 7.0, "fill": "white",    "outline": "black",  "y": "h*0.25", "jitter": True},
+    "clutch":    {"text": "CLUTCH",     "size": 7.0, "fill": "#FFD700",  "outline": "black",  "y": "h*0.80", "jitter": False},
+    "fail":      {"text": "OOF",        "size": 6.0, "fill": "white",    "outline": "#E63946","y": "h*0.78", "jitter": False},
+    "victory":   {"text": "W",          "size": 4.0, "fill": "#22D17B",  "outline": "black",  "y": "h*0.35", "jitter": False},
+    "hype":      {"text": "LET'S GOOO", "size": 8.0, "fill": "#FFD700",  "outline": "black",  "y": "h*0.80", "jitter": False},
+    "emotional": {"text": "...",        "size": 6.0, "fill": "white",    "outline": "black",  "y": "h*0.82", "jitter": False},
+    "cringe":    {"text": "YIKES",      "size": 7.0, "fill": "#FFE34D",  "outline": "black",  "y": "h*0.78", "jitter": False},
+    "weird":     {"text": "???",        "size": 5.5, "fill": "white",    "outline": "black",  "y": "h*0.35", "jitter": True},
+}
 
 
 def _apply_pre_kill_ramp(
@@ -282,7 +307,14 @@ def _pick_video_encoder() -> tuple[str, list[str]]:
         return "h264_videotoolbox", ["-b:v", "8M"]
     if _encoder_works("h264_qsv"):
         return "h264_qsv", ["-global_quality", "22"]
-    return "libx264", ["-preset", "fast", "-crf", "20"]
+    # libx264 with medium preset, CRF 19 (near-lossless), explicit B-frames and
+    # reference frames. Previous default was preset=fast CRF=20 — medium adds
+    # ~40% render time for visibly cleaner compression on detail.
+    return "libx264", [
+        "-preset", "medium", "-crf", "19",
+        "-bf", "3", "-refs", "3",
+        "-tune", "film",
+    ]
 
 
 def _find_font() -> Optional[str]:
@@ -410,6 +442,81 @@ def _drawtext_filter(
     )
 
 
+def _meme_stamp_filter(
+    meme_tag: str,
+    cut_duration: float,
+    tmp_dir: Path,
+) -> Optional[str]:
+    """Build a drawtext filter for a context-matching meme-style stamp.
+
+    Appears in the first half of the cut as a fast pop-in + brief hold + quick
+    fade. Positioned away from the caption baseline (which sits at y=h*0.78)
+    so stamps + captions don't collide on short cuts that have both.
+
+    Returns None when the tag is unknown, the cut is too short to accommodate
+    the stamp, or sanitization leaves nothing renderable.
+    """
+    spec = MEME_STAMPS.get(meme_tag)
+    if not spec:
+        return None
+    text = _sanitize_caption(str(spec["text"]))
+    if not text:
+        return None
+    # Tiny cuts can't accommodate a stamp that actually reads.
+    if cut_duration < 0.9:
+        return None
+
+    # Stamp window: pops in just after the cut's fade-in, holds briefly,
+    # fades before the caption (if any) arrives. Clamp strictly inside cut.
+    start = max(0.15, min(0.35, cut_duration * 0.12))
+    desired_dur = min(1.5, max(0.55, cut_duration * 0.40))
+    end = min(start + desired_dur, cut_duration - 0.1)
+    stamp_dur = end - start
+    if stamp_dur < 0.4:
+        return None
+
+    fname = f"stamp_{meme_tag}_{abs(hash(text)) % 10_000_000}.txt"
+    txt_path = tmp_dir / fname
+    if not txt_path.exists():
+        txt_path.write_text(text, encoding="utf-8")
+
+    font = _find_font()
+    font_arg = f"fontfile='{_ffpath(Path(font))}':" if font else ""
+    size_divisor = float(spec["size"])
+    fill = str(spec["fill"])
+    outline = str(spec["outline"])
+    y_expr = str(spec["y"])
+    jitter = bool(spec.get("jitter", False))
+
+    # Pop-in with slight overshoot (100ms), hold, then 200ms fade-out.
+    pop = 0.10
+    fade = 0.20
+    alpha = (
+        f"if(lt(t\\,{start})\\,0\\,"
+        f"if(lt(t\\,{start + pop})\\,(t-{start})/{pop}\\,"
+        f"if(lt(t\\,{end - fade})\\,1\\,"
+        f"if(lt(t\\,{end})\\,({end}-t)/{fade}\\,0))))"
+    )
+    # Jittering tags get a small periodic x-offset for chaotic energy.
+    if jitter:
+        x_expr = "(w-text_w)/2 + 8*sin(2*PI*t*9)"
+    else:
+        x_expr = "(w-text_w)/2"
+
+    return (
+        f"drawtext={font_arg}"
+        f"textfile='{_ffpath(txt_path)}':"
+        f"fontcolor={fill}:"
+        f"fontsize=(h/{size_divisor}):"
+        f"borderw=5:"
+        f"bordercolor={outline}@0.95:"
+        f"x='{x_expr}':"
+        f"y={y_expr}:"
+        f"alpha='{alpha}':"
+        f"enable='between(t,{start},{end})'"
+    )
+
+
 def _game_volume_expression(
     game_gain_db: float,
     boost_db: float,
@@ -461,6 +568,13 @@ def _build_segment_vf(
     burst = _impact_burst_filter_frag(cut)
     if burst:
         parts.append(burst)
+    # Meme stamp before caption so the caption (if any) renders on top of the
+    # stamp's tail-end fade — they don't overlap spatially but z-order matters
+    # if an author later extends a stamp into the caption region.
+    if cut.meme_tag:
+        stamp = _meme_stamp_filter(cut.meme_tag, float(cut.duration), tmp_dir)
+        if stamp:
+            parts.append(stamp)
     if cut.caption:
         start = max(0.0, float(cut.caption_start_in_cut))
         dur = max(0.4, float(cut.caption_duration))

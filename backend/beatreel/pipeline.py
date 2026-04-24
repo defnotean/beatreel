@@ -38,7 +38,7 @@ MUSIC_ANALYSIS_TIMEOUT_S = 120
 @dataclass
 class PipelineConfig:
     clips_dir: Path
-    music_path: Path
+    music_path: Optional[Path]  # None in auto_clip mode → use source video's original audio
     output_path: Path
     target_duration: float = 60.0
     intensity: Intensity = "balanced"
@@ -58,10 +58,29 @@ class PipelineConfig:
     # (otherwise ducked to -18dB uniformly). Flag-gated because ±500ms Gemini
     # timing tolerance can land a boost on a gunshot instead of the callout.
     experimental_audio_boost: bool = False
+    # Opt-in for the long-form tier in auto-clip mode. When True (and source
+    # has ≥8 qualifying moments), produces a 4th longer-cadence reel alongside
+    # headline/bsides/vibes.
+    include_long_form: bool = False
 
     @property
     def gemini_api_key(self) -> Optional[str]:
         return self.gemini_api_keys[0] if self.gemini_api_keys else None
+
+
+@dataclass
+class TieredOutput:
+    """One rendered output for an auto-clip tier. A 60-min source can produce
+    up to 3-4 tiered reels (headline/bsides/vibes/long_form) from the same
+    moments.json; each has its own composite-score range and cut cadence."""
+    tier: str  # Literal["headline","bsides","vibes","long_form"]
+    path: Path
+    thumbnail_path: Path
+    composite_range: tuple[float, float]
+    num_cuts: int
+    final_duration: float
+    num_captions: int
+    num_moments_in_range: int
 
 
 @dataclass
@@ -74,6 +93,11 @@ class PipelineResult:
     final_duration: float
     seed: Optional[int] = None
     cuts: list[CutPlan] = field(default_factory=list)
+    # Multi-tier outputs (populated only in auto_clip mode). output_path is
+    # kept as the first-rendered tier's path for backwards compatibility with
+    # callers that expect a single reel. Tests can assert either `output_path`
+    # or `outputs[0].path` — they're the same.
+    outputs: list[TieredOutput] = field(default_factory=list)
     # Which detector/planner produced the final cuts. Values:
     #   "director"                    — Gemini director over user-supplied clips
     #   "director-partial-N-failed"   — director ran but N clip analyses failed
@@ -209,6 +233,7 @@ def _director_to_cuts(
     *,
     clip_source_offsets: Optional[list[float]] = None,
     clip_window_durations: Optional[list[float]] = None,
+    clip_meme_tags: Optional[list[Optional[str]]] = None,
 ) -> list[CutPlan]:
     """Convert a validated DirectedReel into concrete CutPlans.
 
@@ -289,6 +314,10 @@ def _director_to_cuts(
                 caption_text = None
                 caption_dur = 2.0
 
+        meme_tag_for_cut: Optional[str] = None
+        if clip_meme_tags is not None and 0 <= dc.clip_index < len(clip_meme_tags):
+            meme_tag_for_cut = clip_meme_tags[dc.clip_index]
+
         out.append(CutPlan(
             clip_path=clip_path,
             start=start_for_cutplan,
@@ -297,6 +326,7 @@ def _director_to_cuts(
             caption_start_in_cut=caption_start,
             caption_duration=caption_dur,
             emphasis=str(getattr(dc, "emphasis", "normal") or "normal"),
+            meme_tag=meme_tag_for_cut,
         ))
 
     if dropped_captions:
@@ -443,6 +473,226 @@ def _write_debug_json(
         logger.warning("couldn't write debug.json: %s", exc)
 
 
+def _plan_tier_cuts(
+    *,
+    tier_name: str,
+    tier_params: dict,
+    tier_moments: list,
+    source_video: Path,
+    source_duration: float,
+    beats: BeatGrid,
+    music_analysis,
+    pool: GeminiPool,
+    config: "PipelineConfig",
+) -> tuple[list[CutPlan], Optional[object], dict, str]:
+    """Build the cut list for one tier. Returns (cuts, directed_reel_or_None,
+    render_opts, detector_used). Uses the director when music_analysis is
+    available; falls through to greedy otherwise."""
+    tier_target = float(tier_params["target_duration"])
+    tier_intensity_override = tier_params.get("intensity_override")
+
+    # Build a synthetic AutoClipperResult with only this tier's moments so
+    # moments_to_clip_summaries produces the right shape.
+    tier_result = auto_clipper_mod.AutoClipperResult(
+        source_video=str(source_video),
+        duration_seconds=source_duration,
+        video_mood=getattr(music_analysis, "vibe", None) or "varied",
+        moments=tier_moments,
+    )
+    clip_summaries = auto_clipper_mod.moments_to_clip_summaries(tier_result, source_video)
+    clips: list[Path] = [source_video] * len(tier_moments)
+    clip_window_durations = [float(m.end_seconds - m.start_seconds) for m in tier_moments]
+    clip_source_offsets = [float(m.start_seconds) for m in tier_moments]
+    clip_meme_tags: list[Optional[str]] = [getattr(m, "meme_tag", None) for m in tier_moments]
+
+    merged_kills = []
+    merged_reactions = []
+    for m in tier_moments:
+        merged_kills.append(gemini_detector.Kill(
+            timestamp_seconds=float(m.caption_start_in_moment_seconds or 0.5),
+            confidence=float(m.composite),
+            description=m.description,
+        ))
+        if m.suggested_caption and m.caption_start_in_moment_seconds is not None:
+            merged_reactions.append(gemini_detector.Reaction(
+                timestamp_seconds=float(m.caption_start_in_moment_seconds),
+                duration_seconds=float(m.caption_duration_seconds or 1.2),
+                caption=m.suggested_caption,
+                kind=m.caption_kind or "voice_comm",
+            ))
+    analyses = {source_video: gemini_detector.ClipAnalysis(
+        kills=merged_kills, reactions=merged_reactions,
+    )}
+
+    cuts: list[CutPlan] = []
+    directed = None
+    detector_used = f"auto-clipper+director[{tier_name}]"
+    render_opts: dict = {}
+
+    if music_analysis is not None:
+        try:
+            beats_list = (beats.beat_times.tolist() if hasattr(beats.beat_times, "tolist") else list(beats.beat_times))
+            bass_list = (beats.bass_onsets.tolist() if hasattr(beats.bass_onsets, "tolist") else list(beats.bass_onsets))
+            directed = director_mod.direct_reel(
+                music_analysis=music_analysis,
+                clip_summaries=clip_summaries,
+                beats_seconds=beats_list,
+                bass_onsets_seconds=bass_list,
+                tempo_bpm=float(beats.tempo),
+                target_duration=tier_target,
+                api_key=pool.next_key(),
+            )
+            cuts = _director_to_cuts(
+                directed, clips, {source_video: source_duration}, analyses,
+                clip_source_offsets=clip_source_offsets,
+                clip_window_durations=clip_window_durations,
+                clip_meme_tags=clip_meme_tags,
+            )
+            if cuts:
+                intro_hold = float(getattr(music_analysis, "best_start_seconds", 0.0) or 0.0)
+                if intro_hold < 0.3:
+                    intro_hold = 0.0
+                render_opts.update(dict(
+                    intro_hold_seconds=intro_hold,
+                    title_caption=getattr(directed, "title_caption", None),
+                    outro_hold_seconds=float(getattr(directed, "outro_hold_seconds", 0.8)),
+                    color_grade=getattr(directed, "color_grade", "teal_orange"),
+                ))
+        except Exception as exc:
+            logger.warning(
+                "director failed for tier %s: %s — using greedy fallback",
+                tier_name, exc,
+            )
+            cuts = []
+
+    # Greedy fallback
+    if not cuts:
+        highlights: list[Highlight] = []
+        for m in tier_moments:
+            peak_local = float(m.caption_start_in_moment_seconds or 0.5)
+            peak_source = float(m.start_seconds) + peak_local
+            highlights.append(Highlight(
+                clip_path=source_video,
+                peak_time=peak_source,
+                score=float(m.composite),
+                clip_duration=source_duration,
+            ))
+        plan_intensity = tier_intensity_override or _effective_intensity(
+            config.intensity,
+            music_analysis.recommended_intensity if music_analysis else None,
+        )
+        plan_intensity = plan_intensity if plan_intensity in ("chill", "balanced", "hype") else "balanced"
+        cuts = _plan_cuts_greedy(
+            highlights, beats, tier_target, plan_intensity, seed=config.seed,
+        )
+        # Annotate emphasis + captions + meme_tag from moment source
+        for c in cuts:
+            for m in tier_moments:
+                if m.start_seconds <= c.start <= m.end_seconds:
+                    c.emphasis = m.emphasis_hint
+                    c.meme_tag = getattr(m, "meme_tag", None)
+                    if m.suggested_caption:
+                        c.caption = m.suggested_caption
+                        c.caption_start_in_cut = max(0.0, float(m.caption_start_in_moment_seconds or 0.0)
+                                                    - (c.start - float(m.start_seconds)))
+                        c.caption_duration = float(m.caption_duration_seconds or 1.2)
+                    break
+        detector_used = f"auto-clipper+greedy[{tier_name}]"
+
+    # If the tier doesn't allow effects (long_form), downgrade all emphasis
+    # to "normal" so velocity ramps + impact bursts + freeze-frame don't fire.
+    if not tier_params.get("allow_effects", True):
+        for c in cuts:
+            c.emphasis = "normal"
+
+    return cuts, directed, render_opts, detector_used
+
+
+# ─── Tier definitions for auto-clip multi-output ─────────────────────────
+# Each tier gets its own director call and render. Moments are partitioned
+# by composite score; tiers below min_moments are skipped (no padded filler).
+# Phase 2 adds "long_form" which requires an explicit opt-in via PipelineConfig.
+TIER_PARAMS: dict[str, dict] = {
+    "headline": {
+        "composite_range": (0.85, 1.01),
+        "target_duration": 45.0,
+        "min_moments": 3,
+        "allow_effects": True,
+        "intensity_override": "hype",
+    },
+    "bsides": {
+        "composite_range": (0.70, 0.85),
+        "target_duration": 45.0,
+        "min_moments": 3,
+        "allow_effects": True,
+        "intensity_override": None,
+    },
+    "vibes": {
+        "composite_range": (0.55, 0.70),
+        "target_duration": 45.0,
+        "min_moments": 3,
+        "allow_effects": True,
+        "intensity_override": "chill",
+    },
+    # Long-form tier: sweeps the full composite range (vibes+bsides+headline
+    # all eligible) into a longer cut. Effects disabled so the edit reads as
+    # a narrative compilation rather than a TikTok-style highlight reel —
+    # velocity ramps and impact bursts look jarring at the 3-4 minute length.
+    "long_form": {
+        "composite_range": (0.55, 1.01),
+        "target_duration": 240.0,
+        "min_moments": 8,
+        "allow_effects": False,
+        "intensity_override": None,
+    },
+}
+
+
+def _filter_moments_for_tier(moments: list, tier_params: dict) -> list:
+    """Return moments whose composite score falls in the tier's range."""
+    lo, hi = tier_params["composite_range"]
+    return [m for m in moments if lo <= m.composite < hi]
+
+
+def _select_active_tiers(config: "PipelineConfig", moments: list) -> list[str]:
+    """Which tiers to render given the config and available moments. In auto-clip
+    mode we always attempt headline/bsides/vibes; long_form only runs when
+    the user opts in via config.include_long_form AND enough moments exist.
+    Tiers with too few moments get skipped per-tier anyway; this is just the
+    starting candidate list."""
+    tiers = ["headline", "bsides", "vibes"]
+    if getattr(config, "include_long_form", False):
+        tiers.append("long_form")
+    return tiers
+
+
+def _generate_thumbnail(
+    reel_path: Path,
+    thumbnail_path: Path,
+    seek_seconds: float = 1.0,
+) -> bool:
+    """Extract one frame at seek_seconds as a JPEG thumbnail. Returns True on
+    success; failures are non-fatal (we render the reel regardless)."""
+    try:
+        import subprocess
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-ss", f"{seek_seconds:.2f}",
+                "-i", str(reel_path),
+                "-vframes", "1",
+                "-vf", "scale=640:360:force_original_aspect_ratio=decrease",
+                "-q:v", "4",
+                str(thumbnail_path),
+            ],
+            check=True, capture_output=True, text=True,
+        )
+        return thumbnail_path.exists()
+    except Exception as exc:
+        logger.warning("thumbnail generation failed for %s: %s", reel_path.name, exc)
+        return False
+
+
 def _run_auto_clip(
     config: PipelineConfig,
     on_progress: Callable[[str, float], None] | None,
@@ -462,36 +712,87 @@ def _run_auto_clip(
 
     pool = GeminiPool.from_keys(config.gemini_api_keys)
 
-    # Kick off music analysis in parallel with the auto-clipper call
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="music-analyze") as music_exec:
-        music_future = music_exec.submit(
+    # Music-optional: if no music uploaded, extract the source video's own
+    # audio and use it as the reel's audio bed. Skip Gemini music analysis —
+    # the source video's audio is unlikely to be a structured music track.
+    music_path = config.music_path
+    extracted_from_source = False
+    if music_path is None:
+        # Music-optional: use the source video's own audio. Generate a silent
+        # "music" track for the render's music-mix input so the renderer's
+        # amix just passes the game-audio through at 0dB. The game audio
+        # track is the original callouts / effects / background — exactly
+        # what the user wants when they didn't upload separate music.
+        silent_music = config.output_path.parent / "silent_music.m4a"
+        report("preparing source audio", 0.03)
+        try:
+            import subprocess
+            # 10min of silence is more than enough for any reel we'd render.
+            # ffmpeg clamps the mix to the video duration via `duration=first`.
+            subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+                    "-t", "600",
+                    "-c:a", "aac", "-b:a", "64k",
+                    str(silent_music),
+                ],
+                check=True, capture_output=True, text=True,
+            )
+            music_path = silent_music
+            extracted_from_source = True
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                f"Failed to prepare silent music track: "
+                f"{exc.stderr[-300:] if exc.stderr else 'unknown error'}"
+            ) from exc
+
+    # Kick off music analysis in parallel with the auto-clipper call. Skip
+    # the analysis entirely when using extracted source audio — a vlog /
+    # gaming VOD's audio isn't a structured track Gemini can analyze as music.
+    if not extracted_from_source:
+        music_analyze_exec: Optional[ThreadPoolExecutor] = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="music-analyze",
+        )
+        music_future = music_analyze_exec.submit(
             gemini_music_analyzer.analyze_music,
-            config.music_path,
+            music_path,
             pool.next_key(),
         )
+    else:
+        music_analyze_exec = None
+        music_future = None
 
-        def clip_progress(stage: str, frac: float) -> None:
-            # Scale auto-clipper progress (5% → 60% of the total) so subsequent
-            # stages have room.
-            report(stage, 0.05 + frac * 0.55)
+    def clip_progress(stage: str, frac: float) -> None:
+        # Scale auto-clipper progress (5% → 60% of the total) so subsequent
+        # stages have room.
+        report(stage, 0.05 + frac * 0.55)
 
-        try:
-            result = auto_clipper_mod.auto_clip(
-                config.source_video, pool.next_key(),
-                on_progress=clip_progress,
-            )
-        except auto_clipper_mod.AutoClipperError as exc:
-            raise RuntimeError(f"Auto-clipper failed: {exc}") from exc
+    try:
+        result = auto_clipper_mod.auto_clip(
+            config.source_video, pool.next_key(),
+            on_progress=clip_progress,
+        )
+    except auto_clipper_mod.AutoClipperError as exc:
+        # Cancel music analysis if it's still running
+        if music_future:
+            music_future.cancel()
+        if music_analyze_exec:
+            music_analyze_exec.shutdown(wait=False)
+        raise RuntimeError(f"Auto-clipper failed: {exc}") from exc
 
+    music_analysis = None
+    if music_future is not None:
         try:
             music_analysis = music_future.result(timeout=MUSIC_ANALYSIS_TIMEOUT_S)
         except FutureTimeoutError:
             music_future.cancel()
             logger.warning("music analysis timed out; continuing without music vibe")
-            music_analysis = None
         except Exception as exc:
             logger.warning("music analysis failed: %s", exc)
-            music_analysis = None
+        finally:
+            if music_analyze_exec:
+                music_analyze_exec.shutdown(wait=False)
 
     if not result.moments:
         _write_auto_clip_debug(config, result, None, None, [])
@@ -511,192 +812,162 @@ def _run_auto_clip(
         logger.warning("couldn't write moments.json: %s", exc)
 
     report("detecting beats", 0.62)
-    beats = detect_beats(config.music_path)
+    beats = detect_beats(music_path)
+    beats_valid = beats.is_valid()
+    if not beats_valid:
+        logger.info(
+            "beat grid invalid (tempo=%.1f, beats=%d) — will place cuts on moment boundaries",
+            beats.tempo, len(beats.beat_times),
+        )
+        # Substitute a sane default tempo so downstream cut-length math
+        # (_cut_length_for) doesn't produce nonsense clamps. The actual
+        # cut placement won't beat-snap — we fall through to moment-boundary
+        # placement — but the planner still uses tempo to compute
+        # intensity-appropriate cut durations.
+        beats = BeatGrid(
+            tempo=120.0,
+            beat_times=beats.beat_times if len(beats.beat_times) > 0 else __import__("numpy").array([]),
+            downbeat_times=beats.downbeat_times,
+            duration=beats.duration,
+            bass_onsets=beats.bass_onsets,
+        )
 
-    # Build director inputs:
-    #  - clips: one Path per moment, all pointing at the source video (used
-    #    for clip_path lookup; the renderer seeks via CutPlan.start).
-    #  - clip_window_durations: each moment's own duration, used for clamp.
-    #  - clip_source_offsets: each moment's start time in the source, used
-    #    to translate moment-relative coordinates to source-absolute in
-    #    _director_to_cuts.
-    #  - analyses: ClipAnalysis per moment, keyed by synthetic Path with
-    #    moment index so cross-ref in _director_to_cuts works per-moment.
     source_video = config.source_video
-    n = len(result.moments)
-    clips: list[Path] = [source_video] * n
-    clip_window_durations = [float(m.end_seconds - m.start_seconds) for m in result.moments]
-    clip_source_offsets = [float(m.start_seconds) for m in result.moments]
-    clip_summaries = auto_clipper_mod.moments_to_clip_summaries(result, source_video)
+    n_total = len(result.moments)
+    active_tiers = _select_active_tiers(config, result.moments)
 
-    # For caption cross-ref: we need per-moment analyses. Since all clips share
-    # the same Path, we build a single merged analysis whose reactions use
-    # moment-RELATIVE timestamps. The director's caption_start_relative is
-    # also moment-relative, so the cross-ref "near" filter still matches.
-    # Caveat: reactions from moment A could false-match cuts drawn from
-    # moment B if both have similar relative timestamps — but since moments
-    # are separate virtual clips (each with its own clip_index), in practice
-    # the director chooses one moment per cut and the reactions are all
-    # present in the merged analysis, so any caption that fits in the cut
-    # window passes. This is permissive but reflects truth: the auto-clipper
-    # already guaranteed caption-to-moment anchoring at extraction time.
-    merged_reactions = []
-    merged_kills = []
-    for m in result.moments:
-        merged_kills.append(gemini_detector.Kill(
-            timestamp_seconds=float(m.caption_start_in_moment_seconds or 0.5),
-            confidence=float(m.composite),
-            description=m.description,
-        ))
-        if m.suggested_caption and m.caption_start_in_moment_seconds is not None:
-            merged_reactions.append(gemini_detector.Reaction(
-                timestamp_seconds=float(m.caption_start_in_moment_seconds),
-                duration_seconds=float(m.caption_duration_seconds or 1.2),
-                caption=m.suggested_caption,
-                kind=m.caption_kind or "voice_comm",
-            ))
-    analyses = {source_video: gemini_detector.ClipAnalysis(
-        kills=merged_kills, reactions=merged_reactions,
-    )}
+    outputs: list[TieredOutput] = []
+    all_cuts: list[CutPlan] = []  # aggregated across tiers for debug.json
+    last_render_opts: dict = {}
+    last_detector_used = "auto-clipper"
+    last_voice_windows: Optional[list[tuple[float, float]]] = None
 
-    # ─── Director call ─────────────────────────────────────────────────
-    # Fallback: if music analysis failed, use the greedy planner over
-    # auto-clipper highlights instead of the director.
-    report("ai director arranging moments", 0.70)
-    cuts: list[CutPlan] = []
-    directed = None
-    detector_used = "auto-clipper+director"
-    render_opts: dict = {}
+    for tier_idx, tier_name in enumerate(active_tiers):
+        tier_params = TIER_PARAMS[tier_name]
+        tier_moments = _filter_moments_for_tier(result.moments, tier_params)
 
-    if music_analysis is not None:
+        if len(tier_moments) < tier_params["min_moments"]:
+            logger.info(
+                "skipping tier %s: %d moments < min %d",
+                tier_name, len(tier_moments), tier_params["min_moments"],
+            )
+            continue
+
+        tier_frac_base = 0.62 + (0.30 * tier_idx / max(1, len(active_tiers)))
+        report(f"planning {tier_name} ({len(tier_moments)} moments)", tier_frac_base)
+
+        cuts, directed, render_opts, detector_used = _plan_tier_cuts(
+            tier_name=tier_name,
+            tier_params=tier_params,
+            tier_moments=tier_moments,
+            source_video=source_video,
+            source_duration=float(result.duration_seconds),
+            beats=beats,
+            music_analysis=music_analysis,
+            pool=pool,
+            config=config,
+        )
+        if not cuts:
+            logger.info("tier %s produced no cuts — skipping", tier_name)
+            continue
+
+        # Experimental voice boost per-tier
+        voice_windows: Optional[list[tuple[float, float]]] = None
+        if config.experimental_audio_boost:
+            voice_windows = _compute_voice_boost_windows(
+                cuts, intro_hold_seconds=float(render_opts.get("intro_hold_seconds", 0.0)),
+            )
+
+        tier_output_path = config.output_path.parent / f"{tier_name}.mp4"
+        thumbnail_path = config.output_path.parent / f"thumbnail_{tier_name}.jpg"
+
+        def tier_render_log(msg: str, _tn=tier_name) -> None:
+            report(f"rendering {_tn}: {msg}", tier_frac_base + 0.08)
+
         try:
-            beats_list = (beats.beat_times.tolist() if hasattr(beats.beat_times, "tolist") else list(beats.beat_times))
-            bass_list = (beats.bass_onsets.tolist() if hasattr(beats.bass_onsets, "tolist") else list(beats.bass_onsets))
-            directed = director_mod.direct_reel(
-                music_analysis=music_analysis,
-                clip_summaries=clip_summaries,
-                beats_seconds=beats_list,
-                bass_onsets_seconds=bass_list,
-                tempo_bpm=float(beats.tempo),
-                target_duration=config.target_duration,
-                api_key=pool.next_key(),
+            render_reel(
+                cuts=cuts,
+                music_path=music_path,
+                output_path=tier_output_path,
+                aspect=config.aspect,
+                on_log=tier_render_log,
+                fade_in_seconds=0.3,
+                fade_out_seconds=0.8,
+                voice_boost_windows=voice_windows,
+                game_gain_db=0.0 if extracted_from_source else -18.0,
+                music_gain_db=0.0 if extracted_from_source else 0.0,
+                **render_opts,
             )
-            cuts = _director_to_cuts(
-                directed, clips, {source_video: result.duration_seconds}, analyses,
-                clip_source_offsets=clip_source_offsets,
-                clip_window_durations=clip_window_durations,
-            )
-            captions_placed = sum(1 for c in cuts if c.caption)
-            if cuts:
-                intro_hold = float(getattr(music_analysis, "best_start_seconds", 0.0) or 0.0)
-                if intro_hold < 0.3:
-                    intro_hold = 0.0
-                render_opts.update(dict(
-                    intro_hold_seconds=intro_hold,
-                    title_caption=getattr(directed, "title_caption", None),
-                    outro_hold_seconds=float(getattr(directed, "outro_hold_seconds", 0.8)),
-                    color_grade=getattr(directed, "color_grade", "teal_orange"),
-                ))
-                report(
-                    f"director placed {len(cuts)} cuts from {n} moments · "
-                    f"{captions_placed} captions",
-                    0.78,
-                )
         except Exception as exc:
-            logger.warning("director failed in auto_clip mode: %s — using greedy fallback", exc)
-            cuts = []
+            logger.warning("tier %s render failed: %s — skipping", tier_name, exc)
+            continue
 
-    # Greedy fallback: if director failed or music analysis failed, rank
-    # moments by composite and fit them into target_duration with beat-snap.
-    if not cuts:
-        report("greedy fallback over moments", 0.72)
-        highlights: list[Highlight] = []
-        for m in result.moments:
-            peak_local = float(m.caption_start_in_moment_seconds or 0.5)
-            peak_source = float(m.start_seconds) + peak_local
-            highlights.append(Highlight(
-                clip_path=source_video,
-                peak_time=peak_source,
-                score=float(m.composite),
-                clip_duration=float(result.duration_seconds),
-            ))
-        plan_intensity = _effective_intensity(
-            config.intensity,
-            music_analysis.recommended_intensity if music_analysis else None,
-        )
-        plan_intensity = plan_intensity if plan_intensity in ("chill", "balanced", "hype") else "balanced"
-        cuts = _plan_cuts_greedy(
-            highlights, beats, config.target_duration, plan_intensity, seed=config.seed,
-        )
-        # Annotate emphasis from moment composite
-        composite_lookup = {float(m.start_seconds): m for m in result.moments}
-        for c in cuts:
-            # Find the moment whose window this cut falls inside (by peak_time)
-            for m in result.moments:
-                if m.start_seconds <= c.start <= m.end_seconds:
-                    c.emphasis = m.emphasis_hint
-                    if m.suggested_caption:
-                        c.caption = m.suggested_caption
-                        c.caption_start_in_cut = max(0.0, float(m.caption_start_in_moment_seconds or 0.0)
-                                                    - (c.start - float(m.start_seconds)))
-                        c.caption_duration = float(m.caption_duration_seconds or 1.2)
-                    break
-        detector_used = "auto-clipper+greedy"
+        # Thumbnail: seek into the middle of the first cut
+        first_cut_mid = cuts[0].duration / 2.0 if cuts else 0.5
+        _generate_thumbnail(tier_output_path, thumbnail_path, seek_seconds=first_cut_mid)
 
-    if not cuts:
-        _write_auto_clip_debug(config, result, music_analysis, directed, [])
-        raise RuntimeError("Auto-clipper produced moments but no valid cuts could be planned")
+        outputs.append(TieredOutput(
+            tier=tier_name,
+            path=tier_output_path,
+            thumbnail_path=thumbnail_path,
+            composite_range=tier_params["composite_range"],
+            num_cuts=len(cuts),
+            final_duration=sum(c.duration for c in cuts)
+                + render_opts.get("intro_hold_seconds", 0.0)
+                + render_opts.get("outro_hold_seconds", 0.0),
+            num_captions=sum(1 for c in cuts if c.caption),
+            num_moments_in_range=len(tier_moments),
+        ))
+        all_cuts.extend(cuts)
+        last_render_opts = render_opts
+        last_voice_windows = voice_windows
+        last_detector_used = detector_used
 
-    # ─── Render ────────────────────────────────────────────────────────
-    def render_log(msg: str) -> None:
-        report(f"rendering: {msg}", 0.85)
-
-    # Experimental voice boost on voice_comm captions — expose reel-timeline
-    # windows to the renderer so game audio lifts during callouts.
-    voice_windows: Optional[list[tuple[float, float]]] = None
-    if config.experimental_audio_boost:
-        voice_windows = _compute_voice_boost_windows(
-            cuts,
-            intro_hold_seconds=float(render_opts.get("intro_hold_seconds", 0.0)),
+    if not outputs:
+        _write_auto_clip_debug(config, result, music_analysis, None, [])
+        raise RuntimeError(
+            f"No tier had enough moments to render (found {n_total} moments; "
+            f"each tier needs at least {min(p['min_moments'] for p in TIER_PARAMS.values())})"
         )
 
-    report("rendering", 0.80)
-    render_reel(
-        cuts=cuts,
-        music_path=config.music_path,
-        output_path=config.output_path,
-        aspect=config.aspect,
-        on_log=render_log,
-        fade_in_seconds=0.3,
-        fade_out_seconds=0.8,
-        voice_boost_windows=voice_windows,
-        **render_opts,
-    )
+    # Back-compat: copy first rendered tier to config.output_path. Existing
+    # callers (tests, main.py serving) that expect `reel.mp4` still work;
+    # new callers read `outputs` for the full tier list.
+    try:
+        import shutil
+        shutil.copyfile(outputs[0].path, config.output_path)
+    except Exception as exc:
+        logger.warning("couldn't copy top tier to output_path: %s", exc)
+
     report("done", 1.0)
 
     _write_auto_clip_debug(
-        config, result, music_analysis, directed, cuts,
-        render_opts=render_opts, voice_windows=voice_windows,
+        config, result, music_analysis, None, all_cuts,
+        render_opts=last_render_opts, voice_windows=last_voice_windows,
     )
-    _write_plan_json(config, cuts, beats.tempo, render_opts)
+    _write_plan_json(config, all_cuts, beats.tempo, last_render_opts)
+
+    # Aggregate return values
+    total_cuts = sum(o.num_cuts for o in outputs)
+    total_captions = sum(o.num_captions for o in outputs)
+    total_duration = sum(o.final_duration for o in outputs) / len(outputs)  # average per tier
 
     return PipelineResult(
         output_path=config.output_path,
+        outputs=outputs,
         tempo=beats.tempo,
         num_clips_scanned=1,
-        num_candidates=n,
-        num_cuts=len(cuts),
-        final_duration=sum(c.duration for c in cuts)
-            + render_opts.get("intro_hold_seconds", 0.0)
-            + render_opts.get("outro_hold_seconds", 0.0),
+        num_candidates=n_total,
+        num_cuts=total_cuts,
+        final_duration=total_duration,
         seed=config.seed,
-        cuts=cuts,
-        detector_used=detector_used,
+        cuts=all_cuts,
+        detector_used=last_detector_used,
         clips_analyzed=1,
         clips_failed=0,
-        captions_placed=sum(1 for c in cuts if c.caption),
+        captions_placed=total_captions,
         source_mode="auto_clip",
-        moments_found=n,
+        moments_found=n_total,
         moments_selected=len(cuts),
     )
 

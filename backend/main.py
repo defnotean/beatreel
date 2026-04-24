@@ -161,6 +161,8 @@ async def create_job(
     clips: Optional[list[UploadFile]] = File(None),
     source_video: Optional[UploadFile] = File(None),
     source_mode: Literal["clips", "auto_clip"] = Form("clips"),
+    include_long_form: bool = Form(False),
+    reuse_music_from_job: Optional[str] = Form(None),
     duration: float = Form(60.0),
     intensity: Literal["chill", "balanced", "hype", "auto"] = Form("balanced"),
     aspect: Literal["landscape", "portrait", "square"] = Form("landscape"),
@@ -200,11 +202,16 @@ async def create_job(
 
     has_music_file = bool(music and music.filename)
     has_youtube = bool(youtube_url)
-    if not has_music_file and not has_youtube:
-        raise HTTPException(
-            status_code=400,
-            detail="Provide either a music file or a youtube_url.",
-        )
+    has_reused_music = bool(reuse_music_from_job)
+    # Music is REQUIRED for clips mode (no source video to fall back to).
+    # OPTIONAL for auto_clip mode — we use the source video's original audio
+    # if no music is uploaded.
+    if not has_music_file and not has_youtube and not has_reused_music:
+        if source_mode != "auto_clip":
+            raise HTTPException(
+                status_code=400,
+                detail="Provide either a music file, a youtube_url, or reuse_music_from_job.",
+            )
 
     # Save uploaded clips
     if has_clip_files:
@@ -235,6 +242,24 @@ async def create_job(
         music_path = job_dir / f"music{music_ext}"
         with music_path.open("wb") as f:
             shutil.copyfileobj(music.file, f)
+    elif has_reused_music and reuse_music_from_job:
+        # Resolve the source job's music file and hard-copy into the new job
+        # directory. Copying rather than referencing keeps each job's directory
+        # self-contained for re-roll and archive cleanup.
+        if not _JOB_ID_PATTERN.match(reuse_music_from_job):
+            raise HTTPException(status_code=400, detail="invalid reuse_music_from_job id")
+        src_job_dir = JOBS_ROOT / reuse_music_from_job
+        src_music = next(
+            (p for p in src_job_dir.iterdir() if p.is_file() and p.stem == "music"),
+            None,
+        ) if src_job_dir.is_dir() else None
+        if src_music is None or not src_music.exists():
+            raise HTTPException(
+                status_code=410,
+                detail="Music from that job is no longer available. Upload a file instead.",
+            )
+        music_path = job_dir / src_music.name
+        shutil.copyfile(src_music, music_path)
 
     # Create the Job record
     job = Job(
@@ -284,6 +309,7 @@ async def create_job(
         "gemini_keys": combined_keys,
         "source_mode": source_mode,
         "source_video_path": source_video_path,
+        "include_long_form": bool(include_long_form),
         "seed": seed,
         "medal_key": x_medal_key,
         "medal_user_id": medal_user_id,
@@ -316,6 +342,7 @@ def _run_job(
     gemini_keys: list[str],
     source_mode: str,
     source_video_path: Optional[Path],
+    include_long_form: bool,
     seed: Optional[int],
     medal_key: Optional[str],
     medal_user_id: Optional[str],
@@ -399,6 +426,7 @@ def _run_job(
             gemini_api_keys=list(gemini_keys or []),
             source_mode=source_mode,  # type: ignore[arg-type]
             source_video=source_video_path,
+            include_long_form=bool(include_long_form),
         )
         with job.lock:
             job.clips_dir = str(clips_dir)
@@ -426,6 +454,122 @@ def _run_job(
         with job.lock:
             job.status = "error"
             job.error = str(exc)
+
+
+_JOB_ID_PATTERN = re.compile(r"^[0-9a-f]{12}$")
+
+
+def _scan_job_dir(job_dir: Path) -> Optional[dict]:
+    """Read one job directory from disk into a history-entry dict.
+
+    Returns None for directories that don't have a recognisable rendered
+    output yet (so partial / crashed jobs don't pollute the history list).
+    """
+    if not job_dir.is_dir() or not _JOB_ID_PATTERN.match(job_dir.name):
+        return None
+
+    tier_files = {
+        name: (job_dir / f"{name}.mp4")
+        for name in ("headline", "bsides", "vibes", "long_form")
+    }
+    rendered_tiers = [n for n, p in tier_files.items() if p.exists()]
+    legacy_reel = job_dir / "reel.mp4"
+    if not rendered_tiers and not legacy_reel.exists():
+        return None
+
+    # Music file: we only track one per job. Pattern: music.<ext>.
+    music_file = next(
+        (p for p in job_dir.iterdir() if p.is_file() and p.stem == "music"),
+        None,
+    )
+    source_file = next(
+        (p for p in job_dir.iterdir() if p.is_file() and p.stem == "source"),
+        None,
+    )
+
+    # Thumbnail: first rendered tier wins; fall back to legacy reel thumbnail.
+    thumb: Optional[Path] = None
+    for t in ("headline", "bsides", "vibes", "long_form"):
+        candidate = job_dir / f"thumbnail_{t}.jpg"
+        if candidate.exists():
+            thumb = candidate
+            break
+    if thumb is None:
+        legacy_thumb = job_dir / "thumbnail.jpg"
+        thumb = legacy_thumb if legacy_thumb.exists() else None
+
+    num_cuts: Optional[int] = None
+    plan_path = job_dir / "plan.json"
+    if plan_path.exists():
+        try:
+            import json as _json_mod
+            plan = _json_mod.loads(plan_path.read_text(encoding="utf-8"))
+            cuts_list = plan.get("cuts") if isinstance(plan, dict) else None
+            if isinstance(cuts_list, list):
+                num_cuts = len(cuts_list)
+        except Exception:
+            pass
+
+    created_ms = int(job_dir.stat().st_mtime * 1000)
+
+    with JOBS_LOCK:
+        live = JOBS.get(job_dir.name)
+    status: str
+    if live:
+        with live.lock:
+            status = live.status
+    else:
+        status = "done"
+
+    return {
+        "job_id": job_dir.name,
+        "status": status,
+        "created_at_ms": created_ms,
+        "tiers": rendered_tiers,
+        "num_cuts": num_cuts,
+        "has_music": music_file is not None,
+        "music_filename": music_file.name if music_file else None,
+        "has_source_video": source_file is not None,
+        "thumbnail_path": thumb.name if thumb else None,
+    }
+
+
+@app.get("/api/jobs")
+def list_jobs(limit: int = 50) -> dict:
+    """List recently-rendered jobs for the History tab.
+
+    Reads the jobs directory directly so completed jobs survive server
+    restarts (in-memory JOBS dict is ephemeral). Jobs without a rendered
+    output file are excluded so crashed / partial runs don't clutter the UI.
+    """
+    limit = max(1, min(200, int(limit)))
+    entries: list[dict] = []
+    try:
+        children = list(JOBS_ROOT.iterdir())
+    except FileNotFoundError:
+        children = []
+    for p in children:
+        entry = _scan_job_dir(p)
+        if entry:
+            entries.append(entry)
+    entries.sort(key=lambda e: e["created_at_ms"], reverse=True)
+    return {"jobs": entries[:limit]}
+
+
+@app.get("/api/jobs/{job_id}/thumbnail")
+def get_job_thumbnail(job_id: str):
+    """Serve the job's tier thumbnail image. Used by the History tab."""
+    if not _JOB_ID_PATTERN.match(job_id):
+        raise HTTPException(status_code=400, detail="invalid job id")
+    job_dir = JOBS_ROOT / job_id
+    for t in ("headline", "bsides", "vibes", "long_form"):
+        candidate = job_dir / f"thumbnail_{t}.jpg"
+        if candidate.exists():
+            return FileResponse(candidate, media_type="image/jpeg")
+    legacy = job_dir / "thumbnail.jpg"
+    if legacy.exists():
+        return FileResponse(legacy, media_type="image/jpeg")
+    raise HTTPException(status_code=404, detail="no thumbnail")
 
 
 @app.get("/api/jobs/{job_id}")
@@ -492,6 +636,7 @@ def reroll_job(job_id: str) -> dict:
             "gemini_keys": reroll_gemini_keys,
             "source_mode": "clips",  # re-roll always uses clips mode (source video gone)
             "source_video_path": None,
+            "include_long_form": False,
             "seed": new_seed,
             "medal_key": None,
             "medal_user_id": None,

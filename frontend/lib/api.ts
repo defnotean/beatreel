@@ -38,6 +38,7 @@ export async function checkHealth(): Promise<{
   ffmpeg: boolean;
   ffmpeg_error: string | null;
   gemini_configured?: boolean;
+  gemini_keys_configured?: number;
 }> {
   const r = await fetch("/api/health");
   if (!r.ok) throw new Error("health check failed");
@@ -118,7 +119,31 @@ export type ClipSource =
 
 export type MusicSource =
   | { type: "upload"; file: File }
-  | { type: "youtube"; url: string };
+  | { type: "youtube"; url: string }
+  | { type: "reuse"; jobId: string };
+
+export interface JobHistoryEntry {
+  job_id: string;
+  status: string;
+  created_at_ms: number;
+  tiers: string[];
+  num_cuts: number | null;
+  has_music: boolean;
+  music_filename: string | null;
+  has_source_video: boolean;
+  thumbnail_path: string | null;
+}
+
+export async function listJobs(limit = 50): Promise<JobHistoryEntry[]> {
+  const r = await fetch(`/api/jobs?limit=${limit}`);
+  if (!r.ok) throw new Error(`list jobs failed: ${r.status}`);
+  const data = (await r.json()) as { jobs: JobHistoryEntry[] };
+  return data.jobs;
+}
+
+export function jobThumbnailUrl(jobId: string): string {
+  return `/api/jobs/${jobId}/thumbnail`;
+}
 
 export type Aspect = "landscape" | "portrait" | "square";
 
@@ -131,6 +156,8 @@ export async function createJob(params: {
   game: "valorant_ai" | "valorant" | "generic";
   /** One OR MANY Gemini keys. Multiple enables parallel per-clip analysis. */
   geminiKeys?: string[];
+  /** Auto-clip mode only: render a 4th long-form tier (3-4 min narrative cut). */
+  includeLongForm?: boolean;
 }): Promise<{ job_id: string }> {
   const fd = new FormData();
   fd.append("duration", String(params.duration));
@@ -160,8 +187,14 @@ export async function createJob(params: {
 
   if (params.music.type === "upload") {
     fd.append("music", params.music.file);
-  } else {
+  } else if (params.music.type === "youtube") {
     fd.append("youtube_url", params.music.url);
+  } else {
+    fd.append("reuse_music_from_job", params.music.jobId);
+  }
+
+  if (params.includeLongForm) {
+    fd.append("include_long_form", "true");
   }
 
   // HTTP headers must be Latin-1 (ISO-8859-1). Strip anything outside that

@@ -3,9 +3,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
+  Clock,
   Copy,
   Film,
   Music,
+  RefreshCw,
   Settings,
   Sparkles,
   Upload,
@@ -15,6 +17,7 @@ import {
 
 import { Logo } from "@/components/Logo";
 import { DropZone } from "@/components/DropZone";
+import { HistoryPanel } from "@/components/HistoryPanel";
 import { IntensityPicker, type Intensity } from "@/components/IntensityPicker";
 import { DurationSlider } from "@/components/DurationSlider";
 import { AspectPicker, type Aspect } from "@/components/AspectPicker";
@@ -29,6 +32,8 @@ import {
   checkHealth,
   createJob,
   getJob,
+  listJobs,
+  type JobHistoryEntry,
   type JobState,
   type MedalClip,
   type YouTubePreview,
@@ -37,9 +42,14 @@ import { loadGeminiKeys, loadMedalSettings } from "@/lib/settings";
 
 type View = "setup" | "processing" | "done" | "error";
 type ClipTab = "upload" | "medal" | "auto_clip";
-type MusicTab = "upload" | "youtube";
+type MusicTab = "upload" | "youtube" | "reuse";
+type PageTab = "create" | "history";
 
 export default function Home() {
+  // Top-level nav
+  const [pageTab, setPageTab] = useState<PageTab>("create");
+  const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
+
   // Source selection
   const [clipTab, setClipTab] = useState<ClipTab>("upload");
   const [musicTab, setMusicTab] = useState<MusicTab>("upload");
@@ -48,6 +58,10 @@ export default function Home() {
   const [clips, setClips] = useState<File[]>([]);
   const [sourceVideo, setSourceVideo] = useState<File[]>([]);
   const [music, setMusic] = useState<File[]>([]);
+  // Reused music: if set, the Music section uses this job's music file.
+  const [reusedMusic, setReusedMusic] = useState<JobHistoryEntry | null>(null);
+  // Auto-clip long-form tier opt-in
+  const [includeLongForm, setIncludeLongForm] = useState(false);
 
   // Medal state
   const [medalLibrarySelected, setMedalLibrarySelected] = useState<Set<string>>(new Set());
@@ -110,7 +124,11 @@ export default function Home() {
         ? sourceVideo.length > 0
         : medalTotal > 0;
   const musicReady =
-    musicTab === "upload" ? music.length > 0 : youtubePreview !== null;
+    musicTab === "upload"
+      ? music.length > 0
+      : musicTab === "reuse"
+        ? reusedMusic !== null
+        : youtubePreview !== null;
   const canSubmit = clipsReady && musicReady && (health?.ffmpeg ?? false);
 
   const clipsSummary = useMemo(() => {
@@ -134,9 +152,13 @@ export default function Home() {
       if (music.length === 0) return null;
       return music[0].name;
     }
+    if (musicTab === "reuse") {
+      if (!reusedMusic) return null;
+      return reusedMusic.music_filename ?? `reel ${reusedMusic.job_id.slice(0, 8)}`;
+    }
     if (!youtubePreview) return null;
     return youtubePreview.title;
-  }, [musicTab, music, youtubePreview]);
+  }, [musicTab, music, youtubePreview, reusedMusic]);
 
   async function onSubmit() {
     if (!canSubmit) return;
@@ -164,7 +186,9 @@ export default function Home() {
       const musicParam =
         musicTab === "upload"
           ? ({ type: "upload" as const, file: music[0] })
-          : ({ type: "youtube" as const, url: youtubeUrl });
+          : musicTab === "reuse" && reusedMusic
+            ? ({ type: "reuse" as const, jobId: reusedMusic.job_id })
+            : ({ type: "youtube" as const, url: youtubeUrl });
 
       const { job_id } = await createJob({
         clips: clipsParam,
@@ -174,6 +198,7 @@ export default function Home() {
         aspect,
         game,
         geminiKeys: geminiKeys.length > 0 ? geminiKeys : undefined,
+        includeLongForm: clipTab === "auto_clip" ? includeLongForm : undefined,
       });
 
       startPolling(job_id);
@@ -228,6 +253,7 @@ export default function Home() {
         if (state.status === "done") {
           if (pollRef.current) clearInterval(pollRef.current);
           setView("done");
+          setHistoryRefreshKey((n) => n + 1);
         } else if (state.status === "error") {
           if (pollRef.current) clearInterval(pollRef.current);
           setErrMsg(state.error || "Pipeline failed");
@@ -268,7 +294,36 @@ export default function Home() {
           </div>
         </header>
 
-        {view === "setup" && (
+        <nav className="flex items-stretch border border-border bg-surface-1 mb-6">
+          <TopTab
+            active={pageTab === "create"}
+            onClick={() => setPageTab("create")}
+            label="Create"
+            icon={<Sparkles className="h-3 w-3" />}
+          />
+          <TopTab
+            active={pageTab === "history"}
+            onClick={() => {
+              setPageTab("history");
+              setHistoryRefreshKey((n) => n + 1);
+            }}
+            label="History"
+            icon={<Clock className="h-3 w-3" />}
+          />
+        </nav>
+
+        {pageTab === "history" && (
+          <HistoryPanel
+            refreshKey={historyRefreshKey}
+            onPickForMusicReuse={(entry) => {
+              setReusedMusic(entry);
+              setMusicTab("reuse");
+              setPageTab("create");
+            }}
+          />
+        )}
+
+        {pageTab === "create" && view === "setup" && (
           <div className="space-y-6">
             <Section index="01" title="Clips" right={clipsSummary}>
               <SourceTabs
@@ -310,6 +365,20 @@ export default function Home() {
                       narrative payoff, technical skill) and the director arranges
                       the top-scored moments to your music.
                     </p>
+                    <label className="flex items-start gap-2 mt-2 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={includeLongForm}
+                        onChange={(e) => setIncludeLongForm(e.target.checked)}
+                        className="mt-0.5 accent-accent"
+                      />
+                      <span className="font-mono text-[10.5px] text-fg-muted leading-relaxed">
+                        <span className="text-fg">+ long-form tier</span> — render an
+                        extra 3-4 minute narrative cut alongside the short-form tiers.
+                        Needs 8+ qualifying moments; effects (ramps, zoom-bursts) are
+                        disabled so it reads as a compilation, not a highlight reel.
+                      </span>
+                    </label>
                   </div>
                 ) : (
                   <MedalPicker
@@ -331,6 +400,7 @@ export default function Home() {
                 tabs={[
                   { key: "upload", label: "Upload", icon: <Upload className="h-3 w-3" /> },
                   { key: "youtube", label: "YouTube", icon: <Youtube className="h-3 w-3" /> },
+                  { key: "reuse", label: "Reuse", icon: <RefreshCw className="h-3 w-3" /> },
                 ]}
                 active={musicTab}
                 onChange={(k) => setMusicTab(k as MusicTab)}
@@ -345,6 +415,12 @@ export default function Home() {
                     files={music}
                     onFiles={(fs) => setMusic([fs[0]])}
                     minH="min-h-[110px]"
+                  />
+                ) : musicTab === "reuse" ? (
+                  <ReuseMusicPicker
+                    selected={reusedMusic}
+                    onSelect={setReusedMusic}
+                    refreshKey={historyRefreshKey}
                   />
                 ) : (
                   <YouTubeInput
@@ -403,9 +479,9 @@ export default function Home() {
           </div>
         )}
 
-        {view === "processing" && job && <ProgressPanel job={job} />}
+        {pageTab === "create" && view === "processing" && job && <ProgressPanel job={job} />}
 
-        {view === "done" && job && (
+        {pageTab === "create" && view === "done" && job && (
           <ResultPanel
             job={job}
             onReset={reset}
@@ -413,7 +489,7 @@ export default function Home() {
           />
         )}
 
-        {view === "error" && (
+        {pageTab === "create" && view === "error" && (
           <ErrorPanel
             message={errMsg ?? "Unknown error"}
             stage={job?.stage ?? null}
@@ -438,6 +514,120 @@ export default function Home() {
         }}
       />
     </main>
+  );
+}
+
+function TopTab({
+  active,
+  onClick,
+  label,
+  icon,
+}: {
+  active: boolean;
+  onClick: () => void;
+  label: string;
+  icon: React.ReactNode;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={
+        "flex-1 flex items-center justify-center gap-2 px-4 py-3 font-mono text-[11.5px] uppercase tracking-[0.14em] transition-colors " +
+        (active
+          ? "bg-surface-2 text-fg"
+          : "text-fg-dim hover:text-fg hover:bg-surface-2/60")
+      }
+    >
+      {icon}
+      {label}
+    </button>
+  );
+}
+
+function ReuseMusicPicker({
+  selected,
+  onSelect,
+  refreshKey,
+}: {
+  selected: JobHistoryEntry | null;
+  onSelect: (entry: JobHistoryEntry | null) => void;
+  refreshKey: number;
+}) {
+  const [jobs, setJobs] = useState<JobHistoryEntry[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setErr(null);
+    listJobs(50)
+      .then((js) => {
+        if (cancelled) return;
+        setJobs(js.filter((j) => j.has_music));
+      })
+      .catch((e) => {
+        if (!cancelled) setErr(e instanceof Error ? e.message : String(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [refreshKey]);
+
+  if (err) {
+    return (
+      <div className="font-mono text-[11px] text-err">
+        Couldn&apos;t load history: {err}
+      </div>
+    );
+  }
+  if (jobs === null) {
+    return (
+      <div className="font-mono text-[11px] uppercase tracking-[0.12em] text-fg-dim py-3">
+        Loading…
+      </div>
+    );
+  }
+  if (jobs.length === 0) {
+    return (
+      <div className="font-mono text-[11px] text-fg-muted py-3">
+        No prior reels with music to reuse yet. Upload a track on the first run.
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-2">
+      <select
+        value={selected?.job_id ?? ""}
+        onChange={(e) => {
+          const id = e.target.value;
+          if (!id) {
+            onSelect(null);
+            return;
+          }
+          const hit = jobs.find((j) => j.job_id === id);
+          onSelect(hit ?? null);
+        }}
+        className="w-full bg-surface-2 border border-border px-3 py-2.5 font-mono text-[12px] text-fg"
+      >
+        <option value="">Pick a prior reel…</option>
+        {jobs.map((j) => (
+          <option key={j.job_id} value={j.job_id}>
+            {j.music_filename ?? j.job_id.slice(0, 8)} —{" "}
+            {new Date(j.created_at_ms).toLocaleString(undefined, {
+              month: "short",
+              day: "numeric",
+              hour: "numeric",
+              minute: "2-digit",
+            })}
+          </option>
+        ))}
+      </select>
+      {selected && (
+        <div className="font-mono text-[10.5px] text-fg-muted">
+          Using music from job {selected.job_id.slice(0, 8)}. The file will be
+          copied into the new job directory.
+        </div>
+      )}
+    </div>
   );
 }
 

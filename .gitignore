@@ -35,3 +35,4 @@ Thumbs.db
 # Env
 .env
 .env.local
+frontend/tsconfig.tsbuildinfo
