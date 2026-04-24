@@ -77,7 +77,7 @@ class TestDirectorE2E:
                 best_start_seconds=0.0,
             )
 
-        def fake_direct_reel(*, music_analysis, clip_summaries, beats_seconds, tempo_bpm, target_duration, api_key):
+        def fake_direct_reel(*, music_analysis, clip_summaries, beats_seconds, bass_onsets_seconds, tempo_bpm, target_duration, api_key):
             # Two cuts from two different clips, one with a valid caption.
             return DirectedReel(
                 chosen_intensity="hype",
@@ -194,7 +194,7 @@ class TestDirectorE2E:
                 best_start_seconds=0.0,
             )
 
-        def fake_director_raises(**kw):
+        def fake_director_raises(*, music_analysis, clip_summaries, beats_seconds, bass_onsets_seconds, tempo_bpm, target_duration, api_key):
             raise RuntimeError("director API down")
 
         monkeypatch.setattr(gemini_detector, "analyze_clips_parallel", fake_analyses)

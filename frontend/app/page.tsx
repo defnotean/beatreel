@@ -7,6 +7,7 @@ import {
   Film,
   Music,
   Settings,
+  Sparkles,
   Upload,
   Youtube,
   Zap,
@@ -35,7 +36,7 @@ import {
 import { loadGeminiKeys, loadMedalSettings } from "@/lib/settings";
 
 type View = "setup" | "processing" | "done" | "error";
-type ClipTab = "upload" | "medal";
+type ClipTab = "upload" | "medal" | "auto_clip";
 type MusicTab = "upload" | "youtube";
 
 export default function Home() {
@@ -45,6 +46,7 @@ export default function Home() {
 
   // Upload state
   const [clips, setClips] = useState<File[]>([]);
+  const [sourceVideo, setSourceVideo] = useState<File[]>([]);
   const [music, setMusic] = useState<File[]>([]);
 
   // Medal state
@@ -101,7 +103,12 @@ export default function Home() {
 
   const medalTotal =
     medalLibrarySelected.size + medalProfileSelected.length + medalUrlClips.length;
-  const clipsReady = clipTab === "upload" ? clips.length > 0 : medalTotal > 0;
+  const clipsReady =
+    clipTab === "upload"
+      ? clips.length > 0
+      : clipTab === "auto_clip"
+        ? sourceVideo.length > 0
+        : medalTotal > 0;
   const musicReady =
     musicTab === "upload" ? music.length > 0 : youtubePreview !== null;
   const canSubmit = clipsReady && musicReady && (health?.ffmpeg ?? false);
@@ -112,9 +119,15 @@ export default function Home() {
       const mb = clips.reduce((a, f) => a + f.size, 0) / 1024 / 1024;
       return `${clips.length} file${clips.length === 1 ? "" : "s"} · ${mb.toFixed(1)} MB`;
     }
+    if (clipTab === "auto_clip") {
+      if (sourceVideo.length === 0) return null;
+      const f = sourceVideo[0];
+      const mb = f.size / 1024 / 1024;
+      return `${f.name} · ${mb.toFixed(1)} MB`;
+    }
     if (medalTotal === 0) return null;
     return `${medalTotal} Medal clip${medalTotal === 1 ? "" : "s"}`;
-  }, [clipTab, clips, medalTotal]);
+  }, [clipTab, clips, sourceVideo, medalTotal]);
 
   const musicSummary = useMemo(() => {
     if (musicTab === "upload") {
@@ -134,17 +147,19 @@ export default function Home() {
       const clipsParam =
         clipTab === "upload"
           ? ({ type: "upload" as const, files: clips })
-          : (() => {
-              const s = loadMedalSettings();
-              return {
-                type: "medal" as const,
-                apiKey: s.apiKey || undefined,
-                userId: s.userId || undefined,
-                clipIds: Array.from(medalLibrarySelected),
-                shareUrls: medalUrlClips.map((c) => c.directClipUrl),
-                publicClips: medalProfileSelected,
-              };
-            })();
+          : clipTab === "auto_clip"
+            ? ({ type: "auto_clip" as const, sourceVideo: sourceVideo[0] })
+            : (() => {
+                const s = loadMedalSettings();
+                return {
+                  type: "medal" as const,
+                  apiKey: s.apiKey || undefined,
+                  userId: s.userId || undefined,
+                  clipIds: Array.from(medalLibrarySelected),
+                  shareUrls: medalUrlClips.map((c) => c.directClipUrl),
+                  publicClips: medalProfileSelected,
+                };
+              })();
 
       const musicParam =
         musicTab === "upload"
@@ -171,6 +186,7 @@ export default function Home() {
   function reset() {
     if (pollRef.current) clearInterval(pollRef.current);
     setClips([]);
+    setSourceVideo([]);
     setMusic([]);
     setMedalLibrarySelected(new Set());
     setMedalProfileSelected([]);
@@ -258,6 +274,7 @@ export default function Home() {
               <SourceTabs
                 tabs={[
                   { key: "upload", label: "Upload", icon: <Upload className="h-3 w-3" /> },
+                  { key: "auto_clip", label: "Auto-clip", icon: <Sparkles className="h-3 w-3" /> },
                   { key: "medal", label: "Medal", icon: <Zap className="h-3 w-3" /> },
                 ]}
                 active={clipTab}
@@ -276,6 +293,24 @@ export default function Home() {
                     onFiles={(fs) => setClips((prev) => dedupe([...prev, ...fs]))}
                     minH="min-h-[200px]"
                   />
+                ) : clipTab === "auto_clip" ? (
+                  <div className="space-y-2">
+                    <DropZone
+                      icon={<Sparkles className="h-5 w-5" />}
+                      title="Drop one full video; Gemini will find the entertaining moments"
+                      hint="Any genre · up to 60 min · MP4 · MOV · MKV"
+                      accept="video/*"
+                      files={sourceVideo}
+                      onFiles={(fs) => setSourceVideo([fs[0]])}
+                      minH="min-h-[200px]"
+                    />
+                    <p className="font-mono text-[10.5px] text-fg-muted leading-relaxed">
+                      Requires a Gemini API key. Gemini scores every moment across
+                      5 dimensions (visual interest, audio peaks, emotional charge,
+                      narrative payoff, technical skill) and the director arranges
+                      the top-scored moments to your music.
+                    </p>
+                  </div>
                 ) : (
                   <MedalPicker
                     librarySelected={medalLibrarySelected}

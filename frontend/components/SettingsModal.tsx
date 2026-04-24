@@ -103,12 +103,18 @@ export function SettingsModal({
             >
               <div className="relative">
                 <textarea
-                  value={showGemini ? geminiKeysText : geminiKeysText.replace(/[^\n,]/g, "•")}
+                  value={geminiKeysText}
                   onChange={(e) => setGeminiKeysText(e.target.value)}
                   placeholder="AIza...&#10;AIza...&#10;AIza..."
                   autoComplete="off"
                   rows={4}
                   spellCheck={false}
+                  style={{
+                    // Visual-only masking — the raw value stays ASCII so we
+                    // don't corrupt the Latin-1 HTTP header when sending.
+                    WebkitTextSecurity: showGemini ? "none" : "disc",
+                    textSecurity: showGemini ? "none" : "disc",
+                  } as React.CSSProperties}
                   className={cn(
                     "w-full bg-bg border border-border px-3 py-2 pr-10",
                     "font-mono text-[12px] text-fg placeholder:text-fg-muted",

@@ -57,6 +57,9 @@ class Job:
     target_duration: float = 60.0
     intensity: str = "balanced"
     game: str = "valorant"
+    source_mode: str = "clips"
+    moments_found: Optional[int] = None
+    moments_selected: Optional[int] = None
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def snapshot(self) -> dict:
@@ -156,6 +159,8 @@ async def youtube_probe(request: Request) -> dict:
 async def create_job(
     music: Optional[UploadFile] = File(None),
     clips: Optional[list[UploadFile]] = File(None),
+    source_video: Optional[UploadFile] = File(None),
+    source_mode: Literal["clips", "auto_clip"] = Form("clips"),
     duration: float = Form(60.0),
     intensity: Literal["chill", "balanced", "hype", "auto"] = Form("balanced"),
     aspect: Literal["landscape", "portrait", "square"] = Form("landscape"),
@@ -178,11 +183,20 @@ async def create_job(
     has_medal_library = bool(medal_clip_ids and x_medal_key)
     has_medal_urls = bool(medal_share_urls)
     has_medal_public = bool(medal_public_clips and medal_public_clips.strip() not in ("", "[]"))
-    if not (has_clip_files or has_medal_library or has_medal_urls or has_medal_public):
-        raise HTTPException(
-            status_code=400,
-            detail="Provide clip files, Medal clip ids (with X-Medal-Key), a Medal profile, or Medal share URLs.",
-        )
+    has_source_video = bool(source_video and source_video.filename)
+
+    if source_mode == "auto_clip":
+        if not has_source_video:
+            raise HTTPException(
+                status_code=400,
+                detail="source_mode=auto_clip requires a source_video upload.",
+            )
+    else:
+        if not (has_clip_files or has_medal_library or has_medal_urls or has_medal_public):
+            raise HTTPException(
+                status_code=400,
+                detail="Provide clip files, Medal clip ids (with X-Medal-Key), a Medal profile, or Medal share URLs.",
+            )
 
     has_music_file = bool(music and music.filename)
     has_youtube = bool(youtube_url)
@@ -206,6 +220,14 @@ async def create_job(
             with dst.open("wb") as f:
                 shutil.copyfileobj(c.file, f)
 
+    # Save uploaded source video for auto_clip mode
+    source_video_path: Optional[Path] = None
+    if has_source_video and source_video:
+        src_ext = Path(source_video.filename or "source.mp4").suffix.lower() or ".mp4"
+        source_video_path = job_dir / f"source{src_ext}"
+        with source_video_path.open("wb") as f:
+            shutil.copyfileobj(source_video.file, f)
+
     # Save uploaded music
     music_path: Optional[Path] = None
     if has_music_file and music:
@@ -222,6 +244,7 @@ async def create_job(
         aspect=aspect,
         seed=seed,
         game=game,
+        source_mode=source_mode,
     )
     with JOBS_LOCK:
         JOBS[job_id] = job
@@ -259,6 +282,8 @@ async def create_job(
         "aspect": aspect,
         "game": game,
         "gemini_keys": combined_keys,
+        "source_mode": source_mode,
+        "source_video_path": source_video_path,
         "seed": seed,
         "medal_key": x_medal_key,
         "medal_user_id": medal_user_id,
@@ -289,6 +314,8 @@ def _run_job(
     aspect: str,
     game: str,
     gemini_keys: list[str],
+    source_mode: str,
+    source_video_path: Optional[Path],
     seed: Optional[int],
     medal_key: Optional[str],
     medal_user_id: Optional[str],
@@ -370,6 +397,8 @@ def _run_job(
             seed=seed,
             game=game,  # type: ignore[arg-type]
             gemini_api_keys=list(gemini_keys or []),
+            source_mode=source_mode,  # type: ignore[arg-type]
+            source_video=source_video_path,
         )
         with job.lock:
             job.clips_dir = str(clips_dir)
@@ -390,6 +419,8 @@ def _run_job(
             job.num_clips_scanned = result.num_clips_scanned
             job.final_duration = result.final_duration
             job.output_path = str(result.output_path)
+            job.moments_found = result.moments_found if result.source_mode == "auto_clip" else None
+            job.moments_selected = result.moments_selected if result.source_mode == "auto_clip" else None
     except Exception as exc:
         traceback.print_exc()
         with job.lock:
@@ -459,6 +490,8 @@ def reroll_job(job_id: str) -> dict:
             "aspect": aspect,
             "game": game,
             "gemini_keys": reroll_gemini_keys,
+            "source_mode": "clips",  # re-roll always uses clips mode (source video gone)
+            "source_video_path": None,
             "seed": new_seed,
             "medal_key": None,
             "medal_user_id": None,

@@ -65,6 +65,10 @@ class DirectedReel(BaseModel):
         description="Extra black-out / fade after the last cut. 0.5-1.5 typical.",
     )
     chosen_intensity: Literal["chill", "balanced", "hype"]
+    color_grade: Optional[Literal["teal_orange", "clinical", "cinematic"]] = Field(
+        default="teal_orange",
+        description="Color grade LUT choice, auto-selected from music vibe. Null to skip grading.",
+    )
     cuts: list[DirectedCut]
 
     @model_validator(mode="after")
@@ -124,33 +128,65 @@ class DirectedReel(BaseModel):
 
 
 SYSTEM_INSTRUCTION = (
-    "You are directing a gameplay highlight reel. You get: (1) an analysis of "
-    "the music (vibe, sections, drops), (2) a summary of each available clip "
-    "including kills and reaction moments with suggested caption text, and "
-    "(3) a precise beat grid from librosa. Your output is a complete cut plan.\n\n"
-    "Rules:\n"
-    "- Match drops to big moments. Multi-kills, aces, or clutches should land "
-    "  ON a drop timestamp from the music analysis.\n"
-    "- Cut durations: hype = 1.2-2.5s, balanced = 2-4s, chill/emotional = 3.5-6.5s. "
-    "  Clamp floors — no cut shorter than 1.0s.\n"
-    "- Total cuts duration + intro_hold + outro_hold should equal the target_duration. "
-    "  It's OK to end earlier if we run out of good material (prefer a tight 30s "
-    "  over a padded 60s).\n"
+    "You are directing a gameplay highlight reel. You get: (1) a music analysis "
+    "(vibe, sections, drops), (2) per-clip summaries (kills, reactions, suggested "
+    "captions), (3) a precise librosa beat grid, and (4) a separate list of BASS "
+    "ONSETS — the timestamps of the track's accented kick/bass hits, which carry "
+    "the track's weight in a way that generic beats do not.\n\n"
+    "CORE RULES\n"
+    "- Match drops to big moments. Multi-kills, aces, or clutches should land ON "
+    "  a drop timestamp from the music analysis.\n"
+    "- Prefer BASS ONSETS over plain beats for emphasis=drop_hit and emphasis=hold "
+    "  cuts — the kill-confirm frame should land on a bass hit if one is available "
+    "  within ~0.3s of where you'd otherwise place the cut. For emphasis=normal "
+    "  cuts, the plain beat grid is fine.\n"
+    "- Cut durations by intensity: hype = 1.2-2.5s, balanced = 2-4s, chill = "
+    "  3.5-6.5s. Clamp floors — no cut shorter than 1.0s. drop_hit cuts can go "
+    "  up to 0.8s longer than the intensity max to accommodate post-peak dwell.\n"
+    "- Total cuts duration + intro_hold + outro_hold should equal target_duration. "
+    "  Prefer a tight short reel over padded filler.\n"
     "- Music-start alignment: the first cut's music_start = intro_hold. Each "
     "  subsequent cut's music_start = previous.music_start + previous.duration. "
     "  No overlaps, no gaps.\n"
-    "- Snap each cut's music_start to the NEAREST librosa beat from the grid "
-    "  (you'll be given it). This keeps cuts on the beat.\n"
-    "- Captions: only include when the clip analysis flagged a reaction near "
-    "  the chosen clip_start. Don't invent captions. If a reaction exists, map "
-    "  caption_start_relative + caption_duration from that reaction's timing "
-    "  inside the cut window.\n"
-    "- Don't reuse the same ~3-second window of the same clip twice. Each cut "
-    "  should cover a distinct moment.\n"
+    "- Don't reuse the same ~3-second window of the same clip twice. Distinct "
+    "  moments only.\n\n"
+    "PACING ARC (trailer curve)\n"
+    "- Distribute cut durations across the timeline like a trailer: Act 1 (first "
+    "  15% of target_duration) favors the upper end of the intensity-appropriate "
+    "  range. Act 2 (15-70%) sits at the middle. Act 3 (70-100%) trends shorter. "
+    "  Constant uniform pacing flattens energy — escalation requires contrast.\n"
+    "- The final 1-2 cuts should be your highest-emphasis moments (the ace, the "
+    "  clutch, the clean multi-kill). Reserve them for the climax, not the middle.\n\n"
+    "MOTION-ON-BEAT\n"
+    "- When choosing clip_start_seconds within a source clip, pick a frame where "
+    "  visible action is BEGINNING — movement, weapon recoil, a step, the start "
+    "  of a swing. Do NOT start on dead air, a walking transition, scoreboard, "
+    "  or buy-phase screens. The first frame of the cut should land on a bass/beat "
+    "  with motion already happening, not lagging behind it.\n\n"
+    "HOLD AFTER PEAK\n"
+    "- For emphasis=drop_hit cuts, include 0.4-0.8s of DWELL past the kill-confirm "
+    "  frame within the cut. This 'breath after impact' is what makes big moments "
+    "  feel weighted. Dwell time is part of the cut's duration budget.\n\n"
+    "FIRST-CLIP HOOK\n"
+    "- The FIRST cut in the reel must begin with visible action within 1 second of "
+    "  clip_start_seconds. No walking, scoreboards, pre-round buy, or dead air as "
+    "  the opener. 3-second retention cliff on short-form is real — the opener "
+    "  decides whether the viewer watches at all.\n\n"
+    "CAPTIONS\n"
+    "- Only include a caption when the clip analysis flagged a reaction near the "
+    "  chosen clip window (±1s). Don't invent captions. If a reaction exists, map "
+    "  caption_start_relative and caption_duration from that reaction's timing.\n\n"
+    "CHOSEN INTENSITY\n"
     "- chosen_intensity defaults to music_analysis.recommended_intensity unless "
-    "  the clip set is sparse (few kills/reactions), in which case step down one.\n"
+    "  the clip set is sparse (few kills/reactions), in which case step down one.\n\n"
+    "COLOR GRADE\n"
+    "- Pick color_grade based on music vibe: hype -> \"clinical\" (high-contrast, "
+    "  punchy); balanced -> \"teal_orange\" (default cinematic); chill or emotional "
+    "  -> \"cinematic\" (desaturated, lifted blacks, soft). Set to null only if the "
+    "  caller should skip grading entirely.\n\n"
+    "OPENING / CLOSING\n"
     "- intro_hold: 0 if the music opens hot. 0.3-1s if there's a soft intro. "
-    "  Title card optional — short words like the player's tag or 'VALORANT'.\n"
+    "  Title card optional — short words like the player's tag.\n"
     "- outro_hold: 0.5-1.2s is typical so the reel doesn't cut abruptly."
 )
 
@@ -164,12 +200,15 @@ def direct_reel(
     music_analysis: MusicAnalysis,
     clip_summaries: list[dict],
     beats_seconds: list[float],
+    bass_onsets_seconds: list[float],
     tempo_bpm: float,
     target_duration: float,
     api_key: str,
 ) -> DirectedReel:
     """Call Gemini as director. `clip_summaries` is a list of dicts with
-    {index, filename, duration, kills: [...], reactions: [...]}."""
+    {index, filename, duration, kills: [...], reactions: [...]}.
+    `bass_onsets_seconds` is the accented bass-hit timeline (preferred snap
+    target for emphasis=drop_hit / hold cuts)."""
     if not api_key:
         raise DirectorError("Missing Gemini API key")
 
@@ -179,6 +218,7 @@ def direct_reel(
         "target_duration": target_duration,
         "tempo_bpm": tempo_bpm,
         "beat_grid_seconds": beats_seconds[:800],  # cap for prompt size
+        "bass_onsets_seconds": bass_onsets_seconds[:400],
         "music_analysis": music_analysis.model_dump(),
         "clips": clip_summaries,
     }

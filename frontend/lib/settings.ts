@@ -31,10 +31,13 @@ function parseKeys(raw: string | null): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
   for (const line of raw.replace(/\r/g, "\n").replace(/,/g, "\n").split("\n")) {
-    const k = line.trim().replace(/^["']|["']$/g, "");
-    if (k && !seen.has(k)) {
-      seen.add(k);
-      out.push(k);
+    // Strip anything outside printable ASCII. This both sanitizes smart-quotes
+    // / bullets / zero-width chars that could sneak in from copy-paste AND
+    // self-heals any keys that got corrupted by a previous masking bug.
+    const cleaned = line.replace(/[^\x20-\x7E]/g, "").trim().replace(/^["']|["']$/g, "");
+    if (cleaned && !seen.has(cleaned)) {
+      seen.add(cleaned);
+      out.push(cleaned);
     }
   }
   return out;

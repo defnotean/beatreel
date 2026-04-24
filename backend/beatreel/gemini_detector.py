@@ -82,8 +82,13 @@ class Reaction(BaseModel):
             "the beat ('TRIPLE KILL', 'CLUTCH 1v3')."
         ),
     )
-    kind: Literal["voice_comm", "hype_moment", "kill_banner"] = Field(
-        description="voice_comm = audible callout; hype_moment = visual celebration; kill_banner = in-game KILL/TRIPLE text."
+    kind: Literal["voice_comm", "hype_moment", "kill_banner", "visual_text", "narrative"] = Field(
+        description=(
+            "voice_comm = audible callout; hype_moment = visual celebration; "
+            "kill_banner = in-game KILL/TRIPLE text; visual_text = any on-screen "
+            "banner/text we're transcribing (generalizes kill_banner beyond games); "
+            "narrative = editor-chosen summary caption."
+        ),
     )
 
 

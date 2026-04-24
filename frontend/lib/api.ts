@@ -113,7 +113,8 @@ export type ClipSource =
       clipIds: string[];
       shareUrls: string[];
       publicClips?: MedalClip[];
-    };
+    }
+  | { type: "auto_clip"; sourceVideo: File };
 
 export type MusicSource =
   | { type: "upload"; file: File }
@@ -138,8 +139,13 @@ export async function createJob(params: {
   fd.append("game", params.game);
 
   if (params.clips.type === "upload") {
+    fd.append("source_mode", "clips");
     for (const c of params.clips.files) fd.append("clips", c);
+  } else if (params.clips.type === "auto_clip") {
+    fd.append("source_mode", "auto_clip");
+    fd.append("source_video", params.clips.sourceVideo);
   } else {
+    fd.append("source_mode", "clips");
     if (params.clips.clipIds.length > 0) {
       fd.append("medal_clip_ids", params.clips.clipIds.join(","));
     }
@@ -158,13 +164,17 @@ export async function createJob(params: {
     fd.append("youtube_url", params.music.url);
   }
 
+  // HTTP headers must be Latin-1 (ISO-8859-1). Strip anything outside that
+  // range or fetch() throws "String contains non ISO-8859-1 code point."
+  // Covers the case where a pasted key has smart quotes / bullets / NBSP.
+  const toAsciiHeader = (v: string) => v.replace(/[^\x20-\x7E]/g, "");
   const headers: Record<string, string> = {};
   if (params.clips.type === "medal" && params.clips.apiKey) {
-    headers["X-Medal-Key"] = params.clips.apiKey;
+    headers["X-Medal-Key"] = toAsciiHeader(params.clips.apiKey);
   }
   if (params.geminiKeys && params.geminiKeys.length > 0) {
     // Backend parses comma/newline-separated keys out of the header value.
-    headers["X-Gemini-Key"] = params.geminiKeys.join(",");
+    headers["X-Gemini-Key"] = toAsciiHeader(params.geminiKeys.join(","));
   }
 
   const r = await fetch("/api/jobs", { method: "POST", body: fd, headers });
