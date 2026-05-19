@@ -29,6 +29,16 @@ dev = [
 scene = [
   "scenedetect[opencv]>=0.6.4",
 ]
+# SOTA beat / downbeat tracker. Madmom's PyPI release breaks on Python 3.11+
+# due to NumPy deprecations; the main-branch git ref has the fixes but pins
+# numpy<2.0 transitively. Install in a dedicated venv if your main env runs
+# numpy 2.x — the default beatreel install works fine without this extra
+# (beats.detect_beats falls back to the librosa path automatically).
+accurate = [
+  "madmom @ git+https://github.com/CPJKU/madmom@main",
+  "numpy<2.0",
+  "cython>=0.29",
+]
 
 [project.scripts]
 beatreel = "beatreel.cli:main"

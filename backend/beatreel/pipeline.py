@@ -188,7 +188,7 @@ def _plan_cuts_greedy(
         if any(not (end <= s or start >= e) for s, e in overlaps):
             continue
         overlaps.append((start, end))
-        snapped = beats.nearest_beat(start)
+        snapped = beats.nearest_beat(start, max_dist_s=0.20)
         clip_end = h.clip_duration
         start = max(0.0, min(snapped, clip_end - duration))
         plans.append(CutPlan(clip_path=h.clip_path, start=start, duration=duration))
